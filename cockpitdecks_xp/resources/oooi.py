@@ -104,6 +104,7 @@ class OOOIObservable(Observable, SimulatorVariableListener):
     """
 
     OBSERVABLE_NAME = "oooi"
+    AUTO_REGISTER = False
 
     def __init__(self, simulator: Simulator):
         oooi_config = {

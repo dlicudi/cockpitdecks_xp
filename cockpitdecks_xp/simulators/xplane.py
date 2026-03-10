@@ -71,7 +71,6 @@ API_MIN_VERSION_STR = "v1"
 REMOTE_TCP_PORT = 8080
 
 USE_REST = True  # force REST usage for remote access, otherwise websockets is privileged
-
 # #############################################
 # PERMANENT DATAREFS
 #
@@ -131,9 +130,7 @@ class Dataref(SimulatorVariable, DatarefAPI):
 
     @property
     def value(self):
-        #
-        # TEMPORARY ADJUSTMENT FOR DATA/BYTES/TEXT DATAREF
-        #
+        # Preserve text/dataref decoding for DATA bytes payloads.
         self._encoding = "ascii" if self._encoding is None else self._encoding
         # https://stackoverflow.com/questions/1021464/how-to-call-a-property-of-the-base-class-if-this-property-is-being-overwritten-i
         if type(DatarefAPI.value.fget(self)) is bytes and self.value_type == DATAREF_DATATYPE.DATA.value:
@@ -916,11 +913,22 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
                         datarefs[ident] = d
             d.inc_monitor()
             effectives[d.name] = d
-        super().add_simulator_variables_to_monitor(simulator_variables=effectives)
+        super().add_simulator_variables_to_monitor(simulator_variables=effectives, reason=reason)
 
         if len(datarefs) > 0:
+            # Update dict BEFORE subscribing so incoming pushes from X-Plane
+            # are not dropped due to missing _dataref_by_id entries.
+            for i, d in datarefs.items():
+                if i in self._dataref_by_id:
+                    if type(d) is list and type(self._dataref_by_id[i]) is list:
+                        for d1 in d:
+                            if d1 not in self._dataref_by_id[i]:
+                                self._dataref_by_id[i].append(d1)
+                    else:
+                        self._dataref_by_id[i] = d
+                else:
+                    self._dataref_by_id[i] = d
             self.register_bulk_dataref_value_event(datarefs=datarefs, on=True)
-            self._dataref_by_id = self._dataref_by_id | datarefs
             dlist = []
             for d in datarefs.values():
                 if type(d) is list:
@@ -967,15 +975,31 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
                     logger.debug(f"{d.name} monitored {d.monitored_count} times, not removed")
             else:
                 logger.debug(f"no need to remove {d.name}, not monitored")
-        super().remove_simulator_variables_to_monitor(simulator_variables=effectives)
+        super().remove_simulator_variables_to_monitor(simulator_variables=effectives, reason=reason)
 
         if len(datarefs) > 0:
-            self.register_bulk_dataref_value_event(datarefs=datarefs, on=False)
-            for i in datarefs.keys():
+            # Remove from _dataref_by_id BEFORE sending the unsubscribe message.
+            # register_bulk_dataref_value_event(on=False) modifies meta.indices,
+            # so we must ensure the ws_listener can no longer find the entry
+            # (and hit a size mismatch) during the transition.
+            to_unsubscribe = {}
+            for i, d in datarefs.items():
                 if i in self._dataref_by_id:
-                    del self._dataref_by_id[i]
+                    if type(d) is list and type(self._dataref_by_id[i]) is list:
+                        for d1 in d:
+                            if d1 in self._dataref_by_id[i]:
+                                self._dataref_by_id[i].remove(d1)
+                        if len(self._dataref_by_id[i]) == 0:
+                            del self._dataref_by_id[i]
+                            to_unsubscribe[i] = d
+                    else:
+                        del self._dataref_by_id[i]
+                        to_unsubscribe[i] = d
                 else:
                     logger.warning(f"no dataref for id={self.all_datarefs.equiv(ident=i)}")
+            
+            if len(to_unsubscribe) > 0:
+                self.register_bulk_dataref_value_event(datarefs=to_unsubscribe, on=False)
             dlist = []
             for d in datarefs.values():
                 if type(d) is list:
@@ -1007,7 +1031,12 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
             if d is not None:
                 ident = d.ident
                 if ident is not None:
-                    datarefs[d.ident] = d
+                    if d.is_array and d.index is not None:
+                        if ident not in datarefs:
+                            datarefs[ident] = []
+                        datarefs[ident].append(d)
+                    else:
+                        datarefs[ident] = d
                     d.inc_monitor()  # increases counter
                 else:
                     logger.warning(f"{d.name} identifier not found")
@@ -1015,8 +1044,17 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
                 logger.warning(f"no dataref {path}")
 
         if len(datarefs) > 0:
+            for i, d in datarefs.items():
+                if i in self._dataref_by_id:
+                    if type(d) is list and type(self._dataref_by_id[i]) is list:
+                        for d1 in d:
+                            if d1 not in self._dataref_by_id[i]:
+                                self._dataref_by_id[i].append(d1)
+                    else:
+                        self._dataref_by_id[i] = d
+                else:
+                    self._dataref_by_id[i] = d
             self.register_bulk_dataref_value_event(datarefs=datarefs, on=True)
-            self._dataref_by_id = self._dataref_by_id | datarefs
             logger.log(SPAM_LEVEL, f">>>>> add_all_simulator_variables_to_monitor: added {[d.path for d in datarefs.values()]}")
         else:
             logger.debug("no simulator variable to monitor")
@@ -1175,7 +1213,6 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
 
     def dataref_newvalue_callback(self, dataref: str, value):
         cascade = dataref in self.simulator_variable_to_monitor
-        # print(f"DREF {dataref}={value} ({cascade})")
         e = DatarefEvent(sim=self, dataref=dataref, value=value, cascade=cascade)
         self.inc(COCKPITDECKS_INTVAR.UPDATE_ENQUEUED.value)
 

@@ -20,6 +20,7 @@ class MapCommandObservable(Observable, SimulatorActivityListener):
     """
 
     OBSERVABLE_NAME = "map-command"
+    AUTO_REGISTER = False
 
     def __init__(self, simulator: Simulator):
         wso_config = {
