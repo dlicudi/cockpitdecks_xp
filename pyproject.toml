@@ -73,7 +73,6 @@ Source = "https://github.com/devleaks/cockpitdecks_xp"
 #
 [tool.ruff]
 line-length = 160
-docstring-code-format = true
 select = [
     "E",
     "F",
