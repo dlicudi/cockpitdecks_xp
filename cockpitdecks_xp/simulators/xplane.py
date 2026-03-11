@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import threading
 import logging
+import time
 from abc import ABC
 from typing import Callable, List
 from enum import IntEnum
@@ -173,7 +174,15 @@ class DatarefEvent(SimulatorEvent):
             try:
                 logger.debug(f"updating {dataref.name}..")
                 self.handling()
-                dataref.update_value(self.value, cascade=self.cascade)
+                started_at = time.perf_counter()
+                listener_count = len(dataref.listeners) if hasattr(dataref, "listeners") else -1
+                changed = dataref.update_value(self.value, cascade=self.cascade)
+                update_duration_ms = (time.perf_counter() - started_at) * 1000.0
+                if update_duration_ms >= 100.0:
+                    logger.info(
+                        f"slow dataref update: {self.dataref_path} took {update_duration_ms:.1f}ms "
+                        f"(changed={changed}, cascade={self.cascade}, listeners={listener_count})"
+                    )
                 self.handled()
                 logger.debug("..updated")
             except:
@@ -626,6 +635,10 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
 
         self._dataref_by_id = {}  # {dataref-id: Dataref}
         self._max_datarefs_monitored = 0  # max(len(self._dataref_by_id))
+        self._throttled_dataref_lock = threading.Lock()
+        self._throttled_dataref_last_sent = {}
+        self._throttled_dataref_pending = {}
+        self._throttled_dataref_timers = {}
 
         self.cmdevents = set()  # list of command active events currently monitored
         self._max_events_monitored = 0
@@ -1213,7 +1226,52 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
 
     def dataref_newvalue_callback(self, dataref: str, value):
         cascade = dataref in self.simulator_variable_to_monitor
-        e = DatarefEvent(sim=self, dataref=dataref, value=value, cascade=cascade)
+        frequency = self.get_frequency(dataref)
+        if frequency is None or frequency <= 0:
+            self._enqueue_dataref_update(dataref=dataref, value=value, cascade=cascade)
+            return
+
+        min_interval = 1.0 / float(frequency)
+        now = time.monotonic()
+        with self._throttled_dataref_lock:
+            last_sent = self._throttled_dataref_last_sent.get(dataref, 0.0)
+            due_at = last_sent + min_interval
+            if now >= due_at:
+                pending_timer = self._throttled_dataref_timers.pop(dataref, None)
+                if pending_timer is not None:
+                    pending_timer.cancel()
+                self._throttled_dataref_pending.pop(dataref, None)
+                self._throttled_dataref_last_sent[dataref] = now
+                enqueue_now = True
+                delay = 0.0
+            else:
+                self._throttled_dataref_pending[dataref] = (value, cascade)
+                enqueue_now = False
+                delay = max(0.0, due_at - now)
+                if dataref in self._throttled_dataref_timers and self._throttled_dataref_timers[dataref].is_alive():
+                    return
+
+                def flush_pending():
+                    with self._throttled_dataref_lock:
+                        self._throttled_dataref_timers.pop(dataref, None)
+                        pending = self._throttled_dataref_pending.pop(dataref, None)
+                        if pending is None:
+                            return
+                        self._throttled_dataref_last_sent[dataref] = time.monotonic()
+                    pending_value, pending_cascade = pending
+                    self._enqueue_dataref_update(dataref=dataref, value=pending_value, cascade=pending_cascade)
+
+                timer = threading.Timer(delay, flush_pending)
+                timer.name = f"XPlane::Throttle::{dataref}"
+                timer.daemon = True
+                self._throttled_dataref_timers[dataref] = timer
+                timer.start()
+
+        if enqueue_now:
+            self._enqueue_dataref_update(dataref=dataref, value=value, cascade=cascade)
+
+    def _enqueue_dataref_update(self, dataref: str, value, cascade: bool):
+        DatarefEvent(sim=self, dataref=dataref, value=value, cascade=cascade)
         self.inc(COCKPITDECKS_INTVAR.UPDATE_ENQUEUED.value)
 
     def command_active_callback(self, command: str, active: bool):
