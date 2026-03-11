@@ -174,15 +174,7 @@ class DatarefEvent(SimulatorEvent):
             try:
                 logger.debug(f"updating {dataref.name}..")
                 self.handling()
-                started_at = time.perf_counter()
-                listener_count = len(dataref.listeners) if hasattr(dataref, "listeners") else -1
                 changed = dataref.update_value(self.value, cascade=self.cascade)
-                update_duration_ms = (time.perf_counter() - started_at) * 1000.0
-                if update_duration_ms >= 100.0:
-                    logger.info(
-                        f"slow dataref update: {self.dataref_path} took {update_duration_ms:.1f}ms "
-                        f"(changed={changed}, cascade={self.cascade}, listeners={listener_count})"
-                    )
                 self.handled()
                 logger.debug("..updated")
             except:
