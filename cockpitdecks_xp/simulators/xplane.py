@@ -7,6 +7,7 @@ import os
 import threading
 import logging
 import time
+import tempfile
 from abc import ABC
 from typing import Callable, List
 from enum import IntEnum
@@ -34,7 +35,10 @@ logger = logging.getLogger(__name__)
 logger.setLevel(DEPRECATION_LEVEL)  # To see which dataref are requested
 # logger.setLevel(logging.DEBUG)
 
-WEBAPILOGFILE = "webapi.log"
+RUNTIME_LOG_DIR = os.path.join(tempfile.gettempdir(), "cockpitdecks")
+os.makedirs(RUNTIME_LOG_DIR, exist_ok=True)
+
+WEBAPILOGFILE = os.path.join(RUNTIME_LOG_DIR, "webapi.log")
 webapi_logger = logging.getLogger("webapi")
 # webapi_logger.setLevel(logging.DEBUG)
 if WEBAPILOGFILE is not None:
