@@ -207,10 +207,10 @@ class OOOIObservable(Observable, SimulatorVariableListener):
                 if self.speed_trend is not None:
                     if self.speed_trend > 0:
                         self.current_state = PHASE.TAKEOFF_ROLL
-                        logger.info(f"speed {round(speed, 2)} > {TAKEOFF_SPEED_MARGIN}, assuming {PHASE.TAKEOFF_ROLL.value}")
+                        logger.info(f"speed {round(speed, 2)} > {ROLL_SPEED_MARGIN}, assuming {PHASE.TAKEOFF_ROLL.value}")
                     elif self.speed_trend <= 0:
                         self.current_state = PHASE.LANDING_ROLL
-                        logger.info(f"speed {round(speed, 2)} > {TAKEOFF_SPEED_MARGIN}, assuming {PHASE.LANDING_ROLL.value}")
+                        logger.info(f"speed {round(speed, 2)} > {ROLL_SPEED_MARGIN}, assuming {PHASE.LANDING_ROLL.value}")
                 return
         logger.debug(f"inited {self.first}")
 
@@ -240,7 +240,9 @@ class OOOIObservable(Observable, SimulatorVariableListener):
                 return "...?"
             return ts.strftime(TIME_FMT)
 
-        report = f"{self.icao_dept}/{self.icao_dest}"
+        icao_dept = getattr(self, "icao_dept", "????")
+        icao_dest = getattr(self, "icao_dest", "????")
+        report = f"{icao_dept}/{icao_dest}"
         off_set = False
         if self.all_oooi.get(OOOI.OUT) is not None:
             report = report + f" OUT/{pt(self.all_oooi.get(OOOI.OUT))}"
@@ -262,10 +264,8 @@ class OOOIObservable(Observable, SimulatorVariableListener):
                 if self.eta is not None and self.eta > self.all_oooi.get(OOOI.ON):  # ETA after landing might be ETA "at the gate"
                     report = report + f" ETA/{pt(self.eta)}"
         else:
-            if not off_set or ALWAYS_FOUR:
+            if not off_set:
                 report = report + " ON/----"
-                if ALWAYS_FOUR:
-                    report = report + " IN/----"
             if self.eta is not None:
                 report = report + f" ETA/{pt(self.eta)}"
 
@@ -276,7 +276,7 @@ class OOOIObservable(Observable, SimulatorVariableListener):
         if self.all_oooi.get(OOOI.OUT) is not None and self.all_oooi.get(OOOI.IN) is not None:
             block_time = self.all_oooi.get(OOOI.IN) - self.all_oooi.get(OOOI.OUT)
             if time_info != "":
-                time_info = time_info = ", "
+                time_info = time_info + ", "
             time_info = time_info + f"block time: {strfdelta(block_time)}"
 
         if display:

@@ -65,6 +65,9 @@ class WeatherStationObservable(Observable, SimulatorVariableListener):
 
         self._last_checked = datetime.now()
         (nearest, coords) = Station.nearest(lat=lat, lon=lon, max_coord_distance=150000)
+        if nearest is None:
+            logger.warning("no nearest station found")
+            return
         if nearest.icao != self._value.value:
             logger.info(f"changed weather station to {nearest.icao} ({round(lat, 6)}, {round(lon, 6)})")
             self.value = nearest.icao
