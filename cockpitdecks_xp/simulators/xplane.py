@@ -212,7 +212,7 @@ class XPlaneInstruction(SimulatorInstruction, ABC):
     def new(cls, name: str, simulator: XPlane, instruction_block: dict | list | tuple) -> XPlaneInstruction | None:
         # INSTRUCTIONS = [CONFIG_KW.BEGIN_END.value, CONFIG_KW.SET_SIM_VARIABLE.value, CONFIG_KW.COMMAND.value, CONFIG_KW.VIEW.value]
 
-        def try_keyword(ib, keyw) -> XPlaneInstruction | None:
+        def try_keyword(ib: dict, keyw) -> XPlaneInstruction | None:
             command_block = ib.get(keyw)
             # single simple command to execute
             if type(command_block) is str:
@@ -249,8 +249,8 @@ class XPlaneInstruction(SimulatorInstruction, ABC):
                         return SetDataref(
                             simulator=simulator,
                             path=command_block,
-                            formula=instruction_block.get("formula"),
-                            text_value=instruction_block.get("text"),
+                            formula=ib.get("formula"),
+                            text_value=ib.get("text"),
                             delay=delay,
                             condition=condition,
                         )
@@ -289,8 +289,8 @@ class XPlaneInstruction(SimulatorInstruction, ABC):
                     performer=simulator,
                     factory=simulator.cockpit,
                     instructions=command_block,
-                    delay=instruction_block.get(CONFIG_KW.DELAY.value, 0.0),
-                    condition=instruction_block.get(CONFIG_KW.CONDITION.value),
+                    delay=ib.get(CONFIG_KW.DELAY.value, 0.0),
+                    condition=ib.get(CONFIG_KW.CONDITION.value),
                 )
 
             if type(command_block) is dict:
@@ -347,11 +347,12 @@ class XPlaneInstruction(SimulatorInstruction, ABC):
             # logger.debug(f"could not find {keyw} in {instruction_block}")
             return None
 
-        if type(instruction_block) in [list, tuple]:
+        if isinstance(instruction_block, (list, tuple)):
             return MacroInstruction(name=name, performer=simulator, factory=simulator.cockpit, instructions=instruction_block)
 
-        if type(instruction_block) is not dict:
+        if not isinstance(instruction_block, dict):
             logger.warning(f"invalid instruction block {instruction_block} ({type(instruction_block)})")
+            return None
 
         if len(instruction_block) == 0:
             logger.debug(f"{name}: instruction block is empty")
