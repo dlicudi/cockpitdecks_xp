@@ -65,8 +65,18 @@ class PythonInterface:
         self.plans: List[FlightPlanInfo] = []
         self.index = 0
         self.loaded = 0
+        self.loaded_filename = ""
+        self.loaded_index = 0
         self.last_status = "INIT"
         self.last_error = ""
+
+        self.map_mode = 0  # 0 = G1000, 1 = GCU478
+        self.map_mode_names = ["G1000", "GCU478"]
+        self.map_range_cmds = {
+            0: ("sim/GPS/g1000n1_range_down", "sim/GPS/g1000n1_range_up"),
+            1: ("sim/GPS/gcu478/range_down", "sim/GPS/gcu478/range_up"),
+        }
+        self.map_cmd_refs = {}
 
         self.accessors = []
         self.commands: Dict[str, Dict[str, object]] = {}
@@ -121,10 +131,13 @@ class PythonInterface:
         self._register_string_dref("plan_waypoints")
         self._register_string_dref("status")
         self._register_string_dref("last_error")
+        self._register_string_dref("loaded_filename")
+        self._register_string_dref("map_mode")
 
         self._register_int_dref("index")
         self._register_int_dref("count")
         self._register_int_dref("loaded")
+        self._register_int_dref("loaded_index")
         self._register_writable_action_dref("action")
         self._register_int_dref("last_action")
         self._register_int_dref("action_ack")
@@ -144,9 +157,17 @@ class PythonInterface:
         self._create_command("wp_previous", "Display previous FMS waypoint", self._cmd_wp_previous)
         self._create_command("wp_direct", "Direct-to displayed FMS waypoint", self._cmd_wp_direct)
         self._create_command("clear_fms_entry", "Clear displayed FMS entry", self._cmd_clear_fms_entry)
+        self._create_command("map_range_down", "Map range zoom in", self._cmd_map_range_down)
+        self._create_command("map_range_up", "Map range zoom out", self._cmd_map_range_up)
+        self._create_command("map_toggle", "Toggle map range target", self._cmd_map_toggle)
 
         self.fpl_cmd = xp.findCommand("sim/GPS/g1000n1_fpl")
         self._log("findCommand sim/GPS/g1000n1_fpl ->", self.fpl_cmd)
+
+        for mode, (down_cmd, up_cmd) in self.map_range_cmds.items():
+            self.map_cmd_refs[mode] = (xp.findCommand(down_cmd), xp.findCommand(up_cmd))
+            self._log("findCommand map range", mode, down_cmd, "->", self.map_cmd_refs[mode][0],
+                      up_cmd, "->", self.map_cmd_refs[mode][1])
 
         self._refresh_plan_list()
         self._publish_state()
@@ -331,7 +352,7 @@ class PythonInterface:
             self.string_values["plan_departure"] = plan.dep
             self.string_values["plan_destination"] = plan.dest
             self.string_values["plan_cycle"] = plan.cycle
-            self.string_values["plan_filename"] = plan.filename
+            self.string_values["plan_filename"] = os.path.splitext(plan.filename)[0]
             self.string_values["plan_path"] = plan.full_path
             self.string_values["plan_dep_runway"] = plan.dep_runway
             self.string_values["plan_dest_runway"] = plan.dest_runway
@@ -341,6 +362,10 @@ class PythonInterface:
             self.int_values["plan_waypoint_count"] = plan.waypoint_count
             self.int_values["plan_max_altitude"] = plan.max_altitude
             self.float_values["plan_distance_nm"] = plan.total_distance_nm
+
+        self.string_values["loaded_filename"] = self.loaded_filename
+        self.int_values["loaded_index"] = self.loaded_index
+        self.string_values["map_mode"] = self.map_mode_names[self.map_mode]
 
         self.string_values["status"] = self.last_status
         self.string_values["last_error"] = self.last_error
@@ -381,6 +406,8 @@ class PythonInterface:
         self._register_live_int_dref("fms_displayed_altitude", self._read_fms_displayed_altitude)
         self._register_live_string_dref("fms_active_ident", self._read_fms_active_ident)
         self._register_live_string_dref("fms_displayed_ident", self._read_fms_displayed_ident)
+        self._register_live_string_dref("fms_first_ident", self._read_fms_first_ident)
+        self._register_live_int_dref("fms_first_altitude", self._read_fms_first_altitude)
         self._register_live_string_dref("fms_last_ident", self._read_fms_last_ident)
         self._register_live_int_dref("fms_last_altitude", self._read_fms_last_altitude)
 
@@ -466,6 +493,26 @@ class PythonInterface:
         info = self._safe_fms_entry_info(xp.getDisplayedFMSEntry())
         return info.altitude if info else 0
 
+    def _read_fms_first_ident(self) -> str:
+        try:
+            count = xp.countFMSEntries()
+            if count <= 0:
+                return "----"
+            info = self._safe_fms_entry_info(0)
+            return info.navAidID if info else "----"
+        except Exception:
+            return "----"
+
+    def _read_fms_first_altitude(self) -> int:
+        try:
+            count = xp.countFMSEntries()
+            if count <= 0:
+                return 0
+            info = self._safe_fms_entry_info(0)
+            return info.altitude if info else 0
+        except Exception:
+            return 0
+
     def _read_fms_last_ident(self) -> str:
         try:
             count = xp.countFMSEntries()
@@ -537,6 +584,25 @@ class PythonInterface:
             self._log("clear_fms_entry: cleared", displayed, "now showing", ident)
         except Exception as exc:
             self._log("clear_fms_entry error:", exc)
+
+    # ── Map range toggle ──
+
+    def _cmd_map_range_down(self):
+        refs = self.map_cmd_refs.get(self.map_mode)
+        if refs and refs[0]:
+            xp.commandOnce(refs[0])
+            self._log("map_range_down", self.map_mode_names[self.map_mode])
+
+    def _cmd_map_range_up(self):
+        refs = self.map_cmd_refs.get(self.map_mode)
+        if refs and refs[1]:
+            xp.commandOnce(refs[1])
+            self._log("map_range_up", self.map_mode_names[self.map_mode])
+
+    def _cmd_map_toggle(self):
+        self.map_mode = 1 - self.map_mode
+        self.string_values["map_mode"] = self.map_mode_names[self.map_mode]
+        self._log("map_toggle ->", self.map_mode_names[self.map_mode])
 
     # ── File browser ──
 
@@ -751,6 +817,8 @@ class PythonInterface:
             xp.setDestinationFMSEntry(len(entries) - 1)
             self._log("Loaded FMS plan", plan.filename, "entries=", len(entries))
             self.loaded = 1
+            self.loaded_filename = os.path.splitext(plan.filename)[0]
+            self.loaded_index = self.index + 1
             self._set_status("LOADED")
         except Exception as exc:
             self.loaded = 0
