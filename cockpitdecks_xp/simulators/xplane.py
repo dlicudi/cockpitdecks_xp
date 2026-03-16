@@ -402,7 +402,7 @@ class Command(XPlaneInstruction, CommandAPI):
         return self.path is not None and self.path.lower().replace("-", "") in Command.NOT_A_COMMAND
 
     def is_valid(self) -> bool:
-        return super().is_valid() and not self.is_no_operation
+        return not self.is_no_operation
 
     def _execute(self) -> bool:
         """Submit execution to API"""
