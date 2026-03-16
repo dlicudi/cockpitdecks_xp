@@ -67,6 +67,9 @@ class PythonInterface:
         self.loaded = 0
         self.loaded_filename = ""
         self.loaded_index = 0
+        self.loaded_sid = ""
+        self.loaded_star = ""
+        self.loaded_distance_nm = 0.0
         self.last_status = "INIT"
         self.last_error = ""
 
@@ -94,6 +97,8 @@ class PythonInterface:
             "plan_sid": "",
             "plan_star": "",
             "plan_waypoints": "",
+            "loaded_sid": "",
+            "loaded_star": "",
             "status": "INIT",
             "last_error": "",
         }
@@ -109,6 +114,7 @@ class PythonInterface:
         }
         self.float_values: Dict[str, float] = {
             "plan_distance_nm": 0.0,
+            "loaded_distance_nm": 0.0,
         }
 
     def _log(self, *parts):
@@ -132,6 +138,8 @@ class PythonInterface:
         self._register_string_dref("status")
         self._register_string_dref("last_error")
         self._register_string_dref("loaded_filename")
+        self._register_string_dref("loaded_sid")
+        self._register_string_dref("loaded_star")
         self._register_string_dref("map_mode")
 
         self._register_int_dref("index")
@@ -145,6 +153,7 @@ class PythonInterface:
         self._register_int_dref("plan_max_altitude")
 
         self._register_float_dref("plan_distance_nm")
+        self._register_float_dref("loaded_distance_nm")
 
         self._register_live_fms_drefs()
 
@@ -365,6 +374,9 @@ class PythonInterface:
 
         self.string_values["loaded_filename"] = self.loaded_filename
         self.int_values["loaded_index"] = self.loaded_index
+        self.string_values["loaded_sid"] = self.loaded_sid
+        self.string_values["loaded_star"] = self.loaded_star
+        self.float_values["loaded_distance_nm"] = self.loaded_distance_nm
         self.string_values["map_mode"] = self.map_mode_names[self.map_mode]
 
         self.string_values["status"] = self.last_status
@@ -819,6 +831,9 @@ class PythonInterface:
             self.loaded = 1
             self.loaded_filename = os.path.splitext(plan.filename)[0]
             self.loaded_index = self.index + 1
+            self.loaded_sid = plan.sid
+            self.loaded_star = plan.star
+            self.loaded_distance_nm = plan.total_distance_nm
             self._set_status("LOADED")
         except Exception as exc:
             self.loaded = 0
