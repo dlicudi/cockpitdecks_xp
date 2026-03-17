@@ -42,6 +42,10 @@ class PythonInterface:
     DREF_PREFIX = "cockpitdecks/fms_browser"
     CMD_PREFIX = "cockpitdecks/fms_browser"
 
+    LEGS_DREF_PREFIX = "cockpitdecks/fms_legs"
+    LEGS_CMD_PREFIX = "cockpitdecks/fms_legs"
+    LEGS_VISIBLE_ROWS = 3
+
     ACTION_NONE = 0
     ACTION_PREVIOUS = 1
     ACTION_NEXT = 2
@@ -80,6 +84,10 @@ class PythonInterface:
             1: ("sim/GPS/gcu478/range_down", "sim/GPS/gcu478/range_up"),
         }
         self.map_cmd_refs = {}
+
+        # LEGS scrollable list state
+        self.legs_selected = 0      # 0-based FMS entry index
+        self.legs_window_start = 0  # 0-based first visible row
 
         self.accessors = []
         self.commands: Dict[str, Dict[str, object]] = {}
@@ -177,6 +185,9 @@ class PythonInterface:
             self.map_cmd_refs[mode] = (xp.findCommand(down_cmd), xp.findCommand(up_cmd))
             self._log("findCommand map range", mode, down_cmd, "->", self.map_cmd_refs[mode][0],
                       up_cmd, "->", self.map_cmd_refs[mode][1])
+
+        self._register_legs_drefs()
+        self._create_legs_commands()
 
         self._refresh_plan_list()
         self._publish_state()
@@ -301,8 +312,8 @@ class PythonInterface:
         self.accessors.append(accessor)
         self._log("Registered writable action dataref", name, "->", accessor)
 
-    def _create_command(self, suffix: str, desc: str, callback):
-        name = f"{self.CMD_PREFIX}/{suffix}"
+    def _create_command(self, suffix: str, desc: str, callback, prefix: str = None):
+        name = f"{prefix or self.CMD_PREFIX}/{suffix}"
         cmd_ref = xp.createCommand(name, desc)
         self._log("createCommand", name, "->", cmd_ref)
         if not cmd_ref:
@@ -423,8 +434,8 @@ class PythonInterface:
         self._register_live_string_dref("fms_last_ident", self._read_fms_last_ident)
         self._register_live_int_dref("fms_last_altitude", self._read_fms_last_altitude)
 
-    def _register_live_int_dref(self, suffix: str, read_fn):
-        name = f"{self.DREF_PREFIX}/{suffix}"
+    def _register_live_int_dref(self, suffix: str, read_fn, prefix: str = None):
+        name = f"{prefix or self.DREF_PREFIX}/{suffix}"
 
         def read_int(refCon):
             return read_fn()
@@ -439,8 +450,8 @@ class PythonInterface:
         self.accessors.append(accessor)
         self._log("Registered live int dataref", name, "->", accessor)
 
-    def _register_live_string_dref(self, suffix: str, read_fn):
-        name = f"{self.DREF_PREFIX}/{suffix}"
+    def _register_live_string_dref(self, suffix: str, read_fn, prefix: str = None):
+        name = f"{prefix or self.DREF_PREFIX}/{suffix}"
 
         def read_data(refCon, values, offset, count):
             text = read_fn()
@@ -835,6 +846,7 @@ class PythonInterface:
             self.loaded_star = plan.star
             self.loaded_distance_nm = plan.total_distance_nm
             self._set_status("LOADED")
+            self._legs_init_after_load()
         except Exception as exc:
             self.loaded = 0
             self._set_status("LOAD ERR", str(exc))
@@ -849,3 +861,176 @@ class PythonInterface:
         else:
             self._set_status("NO FPL CMD", "sim/GPS/g1000n1_fpl not found")
         self._publish_state()
+
+    # ── LEGS scrollable list ──────────────────────────────────
+
+    def _register_legs_drefs(self):
+        p = self.LEGS_DREF_PREFIX
+        # Global state
+        self._register_live_int_dref("selected_index", self._legs_read_selected_index, prefix=p)
+        self._register_live_int_dref("active_index", self._legs_read_active_index, prefix=p)
+        self._register_live_int_dref("entry_count", self._legs_read_entry_count, prefix=p)
+        self._register_live_int_dref("window_start", self._legs_read_window_start, prefix=p)
+        # Per-row datarefs (rows 1-3)
+        for row in range(1, self.LEGS_VISIBLE_ROWS + 1):
+            self._register_live_string_dref(
+                f"row_{row}_index", lambda r=row: self._legs_read_row_index(r), prefix=p)
+            self._register_live_string_dref(
+                f"row_{row}_ident", lambda r=row: self._legs_read_row_ident(r), prefix=p)
+            self._register_live_string_dref(
+                f"row_{row}_alt", lambda r=row: self._legs_read_row_alt(r), prefix=p)
+            self._register_live_int_dref(
+                f"row_{row}_is_active", lambda r=row: self._legs_read_row_is_active(r), prefix=p)
+            self._register_live_int_dref(
+                f"row_{row}_is_selected", lambda r=row: self._legs_read_row_is_selected(r), prefix=p)
+            self._register_live_string_dref(
+                f"row_{row}_status", lambda r=row: self._legs_read_row_status(r), prefix=p)
+
+    def _create_legs_commands(self):
+        p = self.LEGS_CMD_PREFIX
+        self._create_command("scroll_up", "Scroll LEGS selection up", self._cmd_legs_scroll_up, prefix=p)
+        self._create_command("scroll_down", "Scroll LEGS selection down", self._cmd_legs_scroll_down, prefix=p)
+        self._create_command("direct_to", "Direct-to selected LEGS waypoint", self._cmd_legs_direct_to, prefix=p)
+
+    # ── LEGS state helpers ──
+
+    def _legs_fms_index_for_row(self, row: int) -> int:
+        """Convert visible row (1-3) to 0-based FMS entry index. Returns -1 if out of range."""
+        idx = self.legs_window_start + (row - 1)
+        count = self._read_fms_entry_count()
+        if idx < 0 or idx >= count:
+            return -1
+        return idx
+
+    def _legs_ensure_visible(self):
+        """Adjust window_start so legs_selected is visible in the 3-row window."""
+        count = self._read_fms_entry_count()
+        if count <= 0:
+            self.legs_selected = 0
+            self.legs_window_start = 0
+            return
+        self.legs_selected = max(0, min(self.legs_selected, count - 1))
+        if self.legs_selected < self.legs_window_start:
+            self.legs_window_start = self.legs_selected
+        elif self.legs_selected >= self.legs_window_start + self.LEGS_VISIBLE_ROWS:
+            self.legs_window_start = self.legs_selected - self.LEGS_VISIBLE_ROWS + 1
+        max_start = max(0, count - self.LEGS_VISIBLE_ROWS)
+        self.legs_window_start = max(0, min(self.legs_window_start, max_start))
+
+    def _legs_init_after_load(self):
+        """Set LEGS selection to active leg after a plan load."""
+        try:
+            count = xp.countFMSEntries()
+            if count <= 0:
+                self.legs_selected = 0
+                self.legs_window_start = 0
+                return
+            active = xp.getDestinationFMSEntry()
+            # Default to active leg; if active is last entry (destination),
+            # prefer first entry instead (spec: not destination)
+            if active >= count - 1 and count > 1:
+                self.legs_selected = 0
+            else:
+                self.legs_selected = max(0, min(active, count - 1))
+            self._legs_ensure_visible()
+            self._log("legs_init_after_load: selected=", self.legs_selected,
+                      "window=", self.legs_window_start, "count=", count)
+        except Exception as exc:
+            self._log("legs_init_after_load error:", exc)
+            self.legs_selected = 0
+            self.legs_window_start = 0
+
+    # ── LEGS dataref readers ──
+
+    def _legs_read_selected_index(self) -> int:
+        return self.legs_selected + 1  # 1-based for display
+
+    def _legs_read_active_index(self) -> int:
+        return self._read_fms_active_index()  # already 1-based
+
+    def _legs_read_entry_count(self) -> int:
+        return self._read_fms_entry_count()
+
+    def _legs_read_window_start(self) -> int:
+        return self.legs_window_start + 1  # 1-based for display
+
+    def _legs_read_row_index(self, row: int) -> str:
+        idx = self._legs_fms_index_for_row(row)
+        if idx < 0:
+            return ""
+        return str(idx + 1)  # 1-based display
+
+    def _legs_read_row_ident(self, row: int) -> str:
+        idx = self._legs_fms_index_for_row(row)
+        if idx < 0:
+            return ""
+        info = self._safe_fms_entry_info(idx)
+        return info.navAidID if info else ""
+
+    def _legs_read_row_alt(self, row: int) -> str:
+        idx = self._legs_fms_index_for_row(row)
+        if idx < 0:
+            return ""
+        info = self._safe_fms_entry_info(idx)
+        if not info or info.altitude <= 0:
+            return ""
+        return str(info.altitude)
+
+    def _legs_read_row_is_active(self, row: int) -> int:
+        idx = self._legs_fms_index_for_row(row)
+        if idx < 0:
+            return 0
+        try:
+            return 1 if idx == xp.getDestinationFMSEntry() else 0
+        except Exception:
+            return 0
+
+    def _legs_read_row_is_selected(self, row: int) -> int:
+        idx = self._legs_fms_index_for_row(row)
+        if idx < 0:
+            return 0
+        return 1 if idx == self.legs_selected else 0
+
+    def _legs_read_row_status(self, row: int) -> str:
+        is_act = self._legs_read_row_is_active(row)
+        is_sel = self._legs_read_row_is_selected(row)
+        if is_act and is_sel:
+            return "A+S"
+        elif is_act:
+            return "ACT"
+        elif is_sel:
+            return "SEL"
+        return ""
+
+    # ── LEGS commands ──
+
+    def _cmd_legs_scroll_up(self):
+        count = self._read_fms_entry_count()
+        if count <= 0:
+            return
+        if self.legs_selected > 0:
+            self.legs_selected -= 1
+            self._legs_ensure_visible()
+            self._log("legs_scroll_up: selected=", self.legs_selected)
+
+    def _cmd_legs_scroll_down(self):
+        count = self._read_fms_entry_count()
+        if count <= 0:
+            return
+        if self.legs_selected < count - 1:
+            self.legs_selected += 1
+            self._legs_ensure_visible()
+            self._log("legs_scroll_down: selected=", self.legs_selected)
+
+    def _cmd_legs_direct_to(self):
+        try:
+            count = xp.countFMSEntries()
+            if count <= 0:
+                return
+            target = max(0, min(self.legs_selected, count - 1))
+            xp.setDestinationFMSEntry(target)
+            info = self._safe_fms_entry_info(target)
+            ident = info.navAidID if info else "?"
+            self._log("legs_direct_to:", target, ident)
+        except Exception as exc:
+            self._log("legs_direct_to error:", exc)
