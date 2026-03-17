@@ -1008,19 +1008,24 @@ class PythonInterface:
         count = self._read_fms_entry_count()
         if count <= 0:
             return
-        if self.legs_selected > 0:
-            self.legs_selected -= 1
-            self._legs_ensure_visible()
-            self._log("legs_scroll_up: selected=", self.legs_selected)
+        if self.legs_window_start > 0:
+            self.legs_window_start -= 1
+            # Keep selection within visible window
+            if self.legs_selected >= self.legs_window_start + self.LEGS_VISIBLE_ROWS:
+                self.legs_selected = self.legs_window_start + self.LEGS_VISIBLE_ROWS - 1
+            self._log("legs_scroll_up: window=", self.legs_window_start, "selected=", self.legs_selected)
 
     def _cmd_legs_scroll_down(self):
         count = self._read_fms_entry_count()
         if count <= 0:
             return
-        if self.legs_selected < count - 1:
-            self.legs_selected += 1
-            self._legs_ensure_visible()
-            self._log("legs_scroll_down: selected=", self.legs_selected)
+        max_start = max(0, count - self.LEGS_VISIBLE_ROWS)
+        if self.legs_window_start < max_start:
+            self.legs_window_start += 1
+            # Keep selection within visible window
+            if self.legs_selected < self.legs_window_start:
+                self.legs_selected = self.legs_window_start
+            self._log("legs_scroll_down: window=", self.legs_window_start, "selected=", self.legs_selected)
 
     def _cmd_legs_direct_to(self):
         try:
