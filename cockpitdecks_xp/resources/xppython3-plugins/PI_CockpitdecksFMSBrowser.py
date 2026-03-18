@@ -86,7 +86,7 @@ class PythonInterface:
         self.map_cmd_refs = {}
 
         # LEGS scrollable list state
-        self.legs_selected = 0      # 0-based FMS entry index
+        self.legs_selected = -1    # 0-based FMS entry index; -1 = none selected
         self.legs_window_start = 0  # 0-based first visible row
 
         self.accessors = []
@@ -864,6 +864,24 @@ class PythonInterface:
 
     # ── LEGS scrollable list ──────────────────────────────────
 
+    def _legs_read_snapshot(self) -> str:
+        """Build a JSON snapshot of all legs state — one dataref = one atomic WS push."""
+        import json
+        data = {
+            "selected_index": self._legs_read_selected_index(),
+            "active_index": self._legs_read_active_index(),
+            "entry_count": self._legs_read_entry_count(),
+            "window_start": self._legs_read_window_start(),
+        }
+        for row in range(1, self.LEGS_VISIBLE_ROWS + 1):
+            data[f"row_{row}_index"] = self._legs_read_row_index(row)
+            data[f"row_{row}_ident"] = self._legs_read_row_ident(row)
+            data[f"row_{row}_alt"] = self._legs_read_row_alt(row)
+            data[f"row_{row}_is_active"] = self._legs_read_row_is_active(row)
+            data[f"row_{row}_is_selected"] = self._legs_read_row_is_selected(row)
+            data[f"row_{row}_status"] = self._legs_read_row_status(row)
+        return json.dumps(data, separators=(",", ":"))
+
     def _register_legs_drefs(self):
         p = self.LEGS_DREF_PREFIX
         # Global state
@@ -885,12 +903,18 @@ class PythonInterface:
                 f"row_{row}_is_selected", lambda r=row: self._legs_read_row_is_selected(r), prefix=p)
             self._register_live_string_dref(
                 f"row_{row}_status", lambda r=row: self._legs_read_row_status(r), prefix=p)
+        # Single JSON snapshot — all legs data in one WS push
+        self._register_live_string_dref("snapshot", self._legs_read_snapshot, prefix=p)
 
     def _create_legs_commands(self):
         p = self.LEGS_CMD_PREFIX
         self._create_command("scroll_up", "Scroll LEGS selection up", self._cmd_legs_scroll_up, prefix=p)
         self._create_command("scroll_down", "Scroll LEGS selection down", self._cmd_legs_scroll_down, prefix=p)
         self._create_command("direct_to", "Direct-to selected LEGS waypoint", self._cmd_legs_direct_to, prefix=p)
+        self._create_command("select_row_1", "Select waypoint in row 1", self._cmd_legs_select_row_1, prefix=p)
+        self._create_command("select_row_2", "Select waypoint in row 2", self._cmd_legs_select_row_2, prefix=p)
+        self._create_command("select_row_3", "Select waypoint in row 3", self._cmd_legs_select_row_3, prefix=p)
+        self._create_command("clear_selected", "Clear selected LEGS waypoint", self._cmd_legs_clear_selected, prefix=p)
 
     # ── LEGS state helpers ──
 
@@ -906,19 +930,20 @@ class PythonInterface:
         """Adjust window_start so legs_selected is visible in the 3-row window."""
         count = self._read_fms_entry_count()
         if count <= 0:
-            self.legs_selected = 0
+            self.legs_selected = -1
             self.legs_window_start = 0
             return
-        self.legs_selected = max(0, min(self.legs_selected, count - 1))
-        if self.legs_selected < self.legs_window_start:
+        if self.legs_selected >= 0:
+            self.legs_selected = max(0, min(self.legs_selected, count - 1))
+        if self.legs_selected >= 0 and self.legs_selected < self.legs_window_start:
             self.legs_window_start = self.legs_selected
-        elif self.legs_selected >= self.legs_window_start + self.LEGS_VISIBLE_ROWS:
+        elif self.legs_selected >= 0 and self.legs_selected >= self.legs_window_start + self.LEGS_VISIBLE_ROWS:
             self.legs_window_start = self.legs_selected - self.LEGS_VISIBLE_ROWS + 1
         max_start = max(0, count - self.LEGS_VISIBLE_ROWS)
         self.legs_window_start = max(0, min(self.legs_window_start, max_start))
 
     def _legs_init_after_load(self):
-        """Set LEGS selection to active leg after a plan load."""
+        """Set LEGS to page containing active leg after a plan load."""
         try:
             count = xp.countFMSEntries()
             if count <= 0:
@@ -926,24 +951,22 @@ class PythonInterface:
                 self.legs_window_start = 0
                 return
             active = xp.getDestinationFMSEntry()
-            # Default to active leg; if active is last entry (destination),
-            # prefer first entry instead (spec: not destination)
-            if active >= count - 1 and count > 1:
-                self.legs_selected = 0
-            else:
-                self.legs_selected = max(0, min(active, count - 1))
-            self._legs_ensure_visible()
+            active = max(0, min(active, count - 1))
+            # Page-based: window_start = start of page containing active
+            self.legs_window_start = (active // self.LEGS_VISIBLE_ROWS) * self.LEGS_VISIBLE_ROWS
+            self.legs_window_start = max(0, min(self.legs_window_start, count - self.LEGS_VISIBLE_ROWS))
+            self.legs_selected = active
             self._log("legs_init_after_load: selected=", self.legs_selected,
                       "window=", self.legs_window_start, "count=", count)
         except Exception as exc:
             self._log("legs_init_after_load error:", exc)
-            self.legs_selected = 0
+            self.legs_selected = -1
             self.legs_window_start = 0
 
     # ── LEGS dataref readers ──
 
     def _legs_read_selected_index(self) -> int:
-        return self.legs_selected + 1  # 1-based for display
+        return self.legs_selected + 1 if self.legs_selected >= 0 else 0  # 1-based for display; 0 when none
 
     def _legs_read_active_index(self) -> int:
         return self._read_fms_active_index()  # already 1-based
@@ -960,12 +983,28 @@ class PythonInterface:
             return ""
         return str(idx + 1)  # 1-based display
 
+    def _legs_format_ident(self, info) -> str:
+        """Return waypoint ident; for lat/lon entries with empty navAidID, format coords."""
+        if not info:
+            return ""
+        ident = (info.navAidID or "").strip()
+        if ident:
+            return ident
+        # Lat/lon or user waypoint with no navAidID — show truncated coords
+        lat = getattr(info, "latitude", None) or getattr(info, "lat", None)
+        lon = getattr(info, "longitude", None) or getattr(info, "lon", None)
+        if lat is not None and lon is not None:
+            ns = "N" if lat >= 0 else "S"
+            ew = "E" if lon >= 0 else "W"
+            return f"{ns}{abs(lat):.1f}{ew}{abs(lon):.1f}"
+        return "?"
+
     def _legs_read_row_ident(self, row: int) -> str:
         idx = self._legs_fms_index_for_row(row)
         if idx < 0:
             return ""
         info = self._safe_fms_entry_info(idx)
-        return info.navAidID if info else ""
+        return self._legs_format_ident(info)
 
     def _legs_read_row_alt(self, row: int) -> str:
         idx = self._legs_fms_index_for_row(row)
@@ -1005,32 +1044,40 @@ class PythonInterface:
     # ── LEGS commands ──
 
     def _cmd_legs_scroll_up(self):
+        """Previous page (1-3, 4-6, 7-9, ...). Moves window by 3 waypoints."""
         count = self._read_fms_entry_count()
         if count <= 0:
             return
-        if self.legs_window_start > 0:
-            self.legs_window_start -= 1
-            # Keep selection within visible window
-            if self.legs_selected >= self.legs_window_start + self.LEGS_VISIBLE_ROWS:
-                self.legs_selected = self.legs_window_start + self.LEGS_VISIBLE_ROWS - 1
-            self._log("legs_scroll_up: window=", self.legs_window_start, "selected=", self.legs_selected)
+        new_start = max(0, self.legs_window_start - self.LEGS_VISIBLE_ROWS)
+        if new_start != self.legs_window_start:
+            self.legs_window_start = new_start
+            self.legs_selected = self.legs_window_start  # select row 1 of new page
+            self._log("legs_scroll_up: page", self.legs_window_start // self.LEGS_VISIBLE_ROWS + 1,
+                      "window=", self.legs_window_start, "showing", self.legs_window_start + 1, "-",
+                      min(self.legs_window_start + 3, count))
+        else:
+            self._log("legs_scroll_up: already at first page")
 
     def _cmd_legs_scroll_down(self):
+        """Next page (1-3, 4-6, 7-9, ...). Moves window by 3 waypoints."""
         count = self._read_fms_entry_count()
         if count <= 0:
             return
         max_start = max(0, count - self.LEGS_VISIBLE_ROWS)
-        if self.legs_window_start < max_start:
-            self.legs_window_start += 1
-            # Keep selection within visible window
-            if self.legs_selected < self.legs_window_start:
-                self.legs_selected = self.legs_window_start
-            self._log("legs_scroll_down: window=", self.legs_window_start, "selected=", self.legs_selected)
+        new_start = min(max_start, self.legs_window_start + self.LEGS_VISIBLE_ROWS)
+        if new_start != self.legs_window_start:
+            self.legs_window_start = new_start
+            self.legs_selected = self.legs_window_start  # select row 1 of new page
+            self._log("legs_scroll_down: page", self.legs_window_start // self.LEGS_VISIBLE_ROWS + 1,
+                      "window=", self.legs_window_start, "showing", self.legs_window_start + 1, "-",
+                      min(self.legs_window_start + 3, count))
+        else:
+            self._log("legs_scroll_down: already at last page")
 
     def _cmd_legs_direct_to(self):
         try:
             count = xp.countFMSEntries()
-            if count <= 0:
+            if count <= 0 or self.legs_selected < 0:
                 return
             target = max(0, min(self.legs_selected, count - 1))
             xp.setDestinationFMSEntry(target)
@@ -1039,3 +1086,49 @@ class PythonInterface:
             self._log("legs_direct_to:", target, ident)
         except Exception as exc:
             self._log("legs_direct_to error:", exc)
+
+    def _cmd_legs_select_row_1(self):
+        """Select the waypoint visible in row 1 (tap-to-select)."""
+        self._cmd_legs_select_row(1)
+
+    def _cmd_legs_select_row_2(self):
+        """Select the waypoint visible in row 2 (tap-to-select)."""
+        self._cmd_legs_select_row(2)
+
+    def _cmd_legs_select_row_3(self):
+        """Select the waypoint visible in row 3 (tap-to-select)."""
+        self._cmd_legs_select_row(3)
+
+    def _cmd_legs_select_row(self, row: int):
+        """Toggle selection: select the waypoint in row (1-3), or unselect if already selected."""
+        idx = self._legs_fms_index_for_row(row)
+        if idx >= 0:
+            if idx == self.legs_selected:
+                self.legs_selected = -1
+                self._log("legs_select_row:", row, "-> unselected")
+            else:
+                self.legs_selected = idx
+                self._log("legs_select_row:", row, "-> index", idx)
+
+    def _cmd_legs_clear_selected(self):
+        """Clear the selected LEGS waypoint from the route."""
+        try:
+            count = xp.countFMSEntries()
+            if count <= 0 or self.legs_selected < 0:
+                return
+            target = max(0, min(self.legs_selected, count - 1))
+            info = self._safe_fms_entry_info(target)
+            ident = info.navAidID if info else "?"
+            xp.clearFMSEntry(target)
+            # Indices shifted: entries after target moved down
+            if self.legs_selected > target:
+                self.legs_selected -= 1
+            # New count is count-1; clamp selection to valid range
+            self.legs_selected = max(0, min(self.legs_selected, count - 2))
+            # Page-based: clamp window to valid range, do not jump page
+            new_count = count - 1
+            max_start = max(0, new_count - self.LEGS_VISIBLE_ROWS)
+            self.legs_window_start = max(0, min(self.legs_window_start, max_start))
+            self._log("legs_clear_selected: cleared", target, ident)
+        except Exception as exc:
+            self._log("legs_clear_selected error:", exc)
