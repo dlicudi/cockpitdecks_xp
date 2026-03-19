@@ -37,7 +37,7 @@ class PythonInterface:
     NAME = "Cockpitdecks FMS Browser"
     SIG = "xppython3.cockpitdecksfmsbrowser"
     DESC = "Browse Output/FMS plans and load selected plan into default FMS"
-    RELEASE = "2.0.0"
+    RELEASE = "2.0.2"
 
     DREF_PREFIX = "cockpitdecks/fms_browser"
     CMD_PREFIX = "cockpitdecks/fms_browser"
@@ -130,7 +130,7 @@ class PythonInterface:
             print(self.info, *parts)
 
     def XPluginStart(self):
-        self._log("XPluginStart")
+        self._log("XPluginStart", f"LEGS_VISIBLE_ROWS={self.LEGS_VISIBLE_ROWS}")
 
         self._register_string_dref("plan_name")
         self._register_string_dref("plan_departure")
@@ -449,6 +449,47 @@ class PythonInterface:
         )
         self.accessors.append(accessor)
         self._log("Registered live int dataref", name, "->", accessor)
+
+    def _register_writable_legs_window_start(self, prefix: str = None):
+        """Register writable window_start: write 1-based PAGE number (1=rows 1-3, 2=4-6, ...)."""
+        p = prefix or self.LEGS_DREF_PREFIX
+        name = f"{p}/window_start"
+
+        def read_int(refCon):
+            # Return 1-based page number (1, 2, 3...) so encoder-value with step 1 steps by page
+            count = self._read_fms_entry_count()
+            if count <= 0:
+                return 1
+            return self.legs_window_start // self.LEGS_VISIBLE_ROWS + 1
+
+        def write_int(refCon, value):
+            # Interpret value as 1-based page number: 1=rows 1-3, 2=rows 4-6, etc.
+            # This ensures encoder-value with step 1 steps by page, not by row.
+            try:
+                page = max(1, int(value))
+            except (TypeError, ValueError):
+                page = 1
+            count = self._read_fms_entry_count()
+            if count <= 0:
+                return
+            # Allow partial last page (e.g. 5 waypoints: page 2 shows 4, 5, empty row)
+            max_start = max(0, count - 1)
+            new_start = (page - 1) * self.LEGS_VISIBLE_ROWS
+            self.legs_window_start = max(0, min(max_start, new_start))
+            self.legs_selected = -1  # clear selection when paging; user taps to select
+            self._log("window_start write: page", page, "-> window", self.legs_window_start)
+
+        accessor = xp.registerDataAccessor(
+            name,
+            dataType=xp.Type_Int,
+            writable=1,
+            readInt=read_int,
+            writeInt=write_int,
+            readRefCon=None,
+            writeRefCon=None,
+        )
+        self.accessors.append(accessor)
+        self._log("Registered writable legs window_start dataref", name, "->", accessor)
 
     def _register_live_string_dref(self, suffix: str, read_fn, prefix: str = None):
         name = f"{prefix or self.DREF_PREFIX}/{suffix}"
@@ -888,7 +929,7 @@ class PythonInterface:
         self._register_live_int_dref("selected_index", self._legs_read_selected_index, prefix=p)
         self._register_live_int_dref("active_index", self._legs_read_active_index, prefix=p)
         self._register_live_int_dref("entry_count", self._legs_read_entry_count, prefix=p)
-        self._register_live_int_dref("window_start", self._legs_read_window_start, prefix=p)
+        self._register_writable_legs_window_start(prefix=p)
         # Per-row datarefs (rows 1-3)
         for row in range(1, self.LEGS_VISIBLE_ROWS + 1):
             self._register_live_string_dref(
@@ -939,7 +980,8 @@ class PythonInterface:
             self.legs_window_start = self.legs_selected
         elif self.legs_selected >= 0 and self.legs_selected >= self.legs_window_start + self.LEGS_VISIBLE_ROWS:
             self.legs_window_start = self.legs_selected - self.LEGS_VISIBLE_ROWS + 1
-        max_start = max(0, count - self.LEGS_VISIBLE_ROWS)
+        # Allow partial last page (empty rows when count not multiple of 3)
+        max_start = max(0, count - 1)
         self.legs_window_start = max(0, min(self.legs_window_start, max_start))
 
     def _legs_init_after_load(self):
@@ -954,7 +996,8 @@ class PythonInterface:
             active = max(0, min(active, count - 1))
             # Page-based: window_start = start of page containing active
             self.legs_window_start = (active // self.LEGS_VISIBLE_ROWS) * self.LEGS_VISIBLE_ROWS
-            self.legs_window_start = max(0, min(self.legs_window_start, count - self.LEGS_VISIBLE_ROWS))
+            max_start = max(0, count - 1)
+            self.legs_window_start = max(0, min(self.legs_window_start, max_start))
             self.legs_selected = active
             self._log("legs_init_after_load: selected=", self.legs_selected,
                       "window=", self.legs_window_start, "count=", count)
@@ -1051,7 +1094,7 @@ class PythonInterface:
         new_start = max(0, self.legs_window_start - self.LEGS_VISIBLE_ROWS)
         if new_start != self.legs_window_start:
             self.legs_window_start = new_start
-            self.legs_selected = self.legs_window_start  # select row 1 of new page
+            self.legs_selected = -1  # clear selection when paging; user taps to select
             self._log("legs_scroll_up: page", self.legs_window_start // self.LEGS_VISIBLE_ROWS + 1,
                       "window=", self.legs_window_start, "showing", self.legs_window_start + 1, "-",
                       min(self.legs_window_start + 3, count))
@@ -1059,15 +1102,15 @@ class PythonInterface:
             self._log("legs_scroll_up: already at first page")
 
     def _cmd_legs_scroll_down(self):
-        """Next page (1-3, 4-6, 7-9, ...). Moves window by 3 waypoints."""
+        """Next page (1-3, 4-6, 7-9, ...). Partial last page OK (e.g. 5 wpts: page 2 shows 4, 5, empty)."""
         count = self._read_fms_entry_count()
         if count <= 0:
             return
-        max_start = max(0, count - self.LEGS_VISIBLE_ROWS)
+        max_start = max(0, count - 1)
         new_start = min(max_start, self.legs_window_start + self.LEGS_VISIBLE_ROWS)
         if new_start != self.legs_window_start:
             self.legs_window_start = new_start
-            self.legs_selected = self.legs_window_start  # select row 1 of new page
+            self.legs_selected = -1  # clear selection when paging; user taps to select
             self._log("legs_scroll_down: page", self.legs_window_start // self.LEGS_VISIBLE_ROWS + 1,
                       "window=", self.legs_window_start, "showing", self.legs_window_start + 1, "-",
                       min(self.legs_window_start + 3, count))
@@ -1125,9 +1168,9 @@ class PythonInterface:
                 self.legs_selected -= 1
             # New count is count-1; clamp selection to valid range
             self.legs_selected = max(0, min(self.legs_selected, count - 2))
-            # Page-based: clamp window to valid range, do not jump page
+            # Clamp window to valid range; allow partial last page
             new_count = count - 1
-            max_start = max(0, new_count - self.LEGS_VISIBLE_ROWS)
+            max_start = max(0, new_count - 1)
             self.legs_window_start = max(0, min(self.legs_window_start, max_start))
             self._log("legs_clear_selected: cleared", target, ident)
         except Exception as exc:
