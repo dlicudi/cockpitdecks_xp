@@ -46,10 +46,10 @@ classifiers = [
 requires-python = ">=3.10"
 
 dependencies = [
-    "cockpitdecks @ git+https://github.com/devleaks/cockpitdecks.git",
+    "cockpitdecks>=15.14.2,<16",
     "xpwebapi @ git+https://github.com/devleaks/xplane-webapi.git",
     "metar~=1.11.0",
-    "avwx-engine~=1.9.0",
+    "avwx-engine[scipy]~=1.9.0",
 ]
 
 dynamic = [
