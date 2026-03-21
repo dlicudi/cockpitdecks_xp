@@ -875,6 +875,46 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
     def aircraft_changed(self):
         """When notified that the aircraft has changed, we need to reload all datarefs and commands (since they all changed)"""
         self.reload_caches(force=True)
+        self.resync_monitored_dataref_subscriptions()
+
+    def resync_monitored_dataref_subscriptions(self):
+        """After reload_caches(), X-Plane reassigns dataref numeric ids. Re-subscribe websocket
+        monitoring so _dataref_by_id keys match the simulator and REST /datarefs/{id}/value works."""
+        if not self.connected:
+            return
+        if len(self._dataref_by_id) > 0:
+            self.register_bulk_dataref_value_event(datarefs=self._dataref_by_id, on=False)
+        self._dataref_by_id = {}
+        self._requested_indices_by_id = {}
+        datarefs = {}
+        for path in list(self.simulator_variable_to_monitor.keys()):
+            d = self.get_variable(path)
+            if not isinstance(d, SimulatorVariable):
+                continue
+            ident = d.ident
+            if ident is None:
+                logger.warning(f"{d.name}: no dataref id after cache reload, skipping resubscribe")
+                continue
+            if d.is_array and d.index is not None:
+                if ident not in datarefs:
+                    datarefs[ident] = []
+                datarefs[ident].append(d)
+            else:
+                datarefs[ident] = d
+        if len(datarefs) == 0:
+            return
+        for i, d in datarefs.items():
+            if i in self._dataref_by_id:
+                if type(d) is list and type(self._dataref_by_id[i]) is list:
+                    for d1 in d:
+                        if d1 not in self._dataref_by_id[i]:
+                            self._dataref_by_id[i].append(d1)
+                else:
+                    self._dataref_by_id[i] = d
+            else:
+                self._dataref_by_id[i] = d
+        self.register_bulk_dataref_value_event(datarefs=datarefs, on=True)
+        logger.info(f"resynced {len(datarefs)} websocket dataref subscription group(s) after dataref cache reload")
 
     def get_variables(self) -> set:
         """Returns the list of datarefs for which cockpitdecks wants to be notified of changes."""
