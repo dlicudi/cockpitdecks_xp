@@ -70,7 +70,11 @@ API_MAX_VERSION_STR = "v2"
 API_HOST = "127.0.0.1"
 API_TPC_PORT = 8086
 API_PATH = "/api"
-API_MIN_VERSION_STR = "v1"
+# Default WebSocket/REST API path version (v1 = /api/v1, v2 = /api/v2). X-Plane 12.1.4+ uses v2 for current WS features;
+# staying on v1 after the UDP beacon upgrades REST to v2 leaves a stale WS and breaks subscriptions on newer sims.
+# Override with environ API_VERSION (e.g. v1) only if you must talk to an older API build.
+# xpwebapi upgrades REST+WS to v3 automatically on X-Plane 12.4+ when the simulator advertises it.
+DEFAULT_WEB_API_VERSION_STR = "v2"
 # see https://gist.github.com/devleaks/729bda6db10007b844111178694c7971
 # when adressing api on remote host, this is the port number of the **proxy** to X-Plane standard :8086 port
 REMOTE_TCP_PORT = 8080
@@ -721,12 +725,20 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
         self._beacon.set_callback(self.beacon_callback)
         self.dynamic_timeout = RECONNECT_TIMEOUT
         self.xp_home = environ.get(ENVIRON_KW.SIMULATOR_HOME.value)
-        self.api_host = environ.get(ENVIRON_KW.API_HOST.value, API_HOST)
+        raw_host = environ.get(ENVIRON_KW.API_HOST.value, API_HOST)
         self.api_port = environ.get(ENVIRON_KW.API_PORT.value, API_TPC_PORT)
         self.api_path = environ.get(ENVIRON_KW.API_PATH.value, API_PATH)
-        self.api_version = environ.get(ENVIRON_KW.API_VERSION.value, API_MIN_VERSION_STR)
+        self.api_version = environ.get(ENVIRON_KW.API_VERSION.value, DEFAULT_WEB_API_VERSION_STR)
 
-        XPWebsocketAPI.__init__(self, host=self.api_host[0], port=self.api_host[1], api=self.api_path, api_version=self.api_version, use_rest=USE_REST)
+        # API_HOST may be a string (hostname) with API_PORT separate, or a legacy [host, port] pair from YAML.
+        if isinstance(raw_host, (list, tuple)) and len(raw_host) >= 2:
+            self.api_host = str(raw_host[0])
+            ws_port = int(raw_host[1])
+        else:
+            self.api_host = str(raw_host)
+            ws_port = int(self.api_port)
+
+        XPWebsocketAPI.__init__(self, host=self.api_host, port=ws_port, api=self.api_path, api_version=self.api_version, use_rest=USE_REST)
         # XPWebsocketAPI callbacks
         self.add_callback(cbtype=CALLBACK_TYPE.ON_DATAREF_UPDATE, callback=self.dataref_newvalue_callback)
         self.add_callback(cbtype=CALLBACK_TYPE.ON_COMMAND_ACTIVE, callback=self.command_active_callback)
