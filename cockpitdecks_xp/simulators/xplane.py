@@ -1540,8 +1540,15 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
             logger.info("aircraft loaded")
 
         if self.is_aircraft_loaded:
-            logger.info("request to reload pages")
-            self.cockpit.reload_pages()  # to request page variables and take into account updated values
+            aircraft_path = self._aircraft_path.value
+            if isinstance(aircraft_path, (bytes, bytearray)):
+                aircraft_path = aircraft_path.decode()
+            if aircraft_path:
+                logger.info(f"aircraft already loaded at startup, triggering change_aircraft({aircraft_path!r})")
+                self.cockpit.change_aircraft(newpath=aircraft_path)
+            else:
+                logger.info("request to reload pages")
+                self.cockpit.reload_pages()  # to request page variables and take into account updated values
         # logger.info(f"{self.name} started")
 
     def _on_stop(self, connected: bool):
