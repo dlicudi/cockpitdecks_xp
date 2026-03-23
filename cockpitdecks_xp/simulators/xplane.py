@@ -156,14 +156,10 @@ class DatarefEvent(SimulatorEvent):
     The value change and propagation only occurs when executed (run) by the Cockpit.
     """
 
-    LEGS_SNAPSHOT_DREF = "cockpitdecks/fms_legs/snapshot"
-    LEGS_DREF_PREFIX = "cockpitdecks/fms_legs/"
-
     def __init__(self, sim: Simulator, dataref: str, value: float | str, cascade: bool, autorun: bool = True):
         self.dataref_path = dataref
         self.value = value
         self.cascade = cascade
-        self._created_at = time.monotonic()
         SimulatorEvent.__init__(self, sim=sim, autorun=autorun)
 
     def __str__(self):
@@ -172,84 +168,21 @@ class DatarefEvent(SimulatorEvent):
     def info(self):
         return super().info() | {"path": self.dataref_path, CONFIG_KW.VALUE.value: self.value, "cascade": self.cascade}
 
-    def _handle_legs_snapshot(self) -> bool:
-        """Parse JSON snapshot, update all individual legs datarefs, force-render all LEGS buttons."""
-        import json
-        if self.value is None:
-            return False
-
-        t0 = time.monotonic()
-        try:
-            data = json.loads(self.value)
-        except (json.JSONDecodeError, TypeError):
-            return False
-        parse_ms = (time.monotonic() - t0) * 1000
-        if not data:
-            return False
-
-        db = self.sim.cockpit.variable_database
-        affected_buttons = set()
-
-        # Phase 1: Update all variables with cascade=False to avoid N×M redundant
-        # variable_changed calls (each of ~20 vars would notify ~4 buttons each).
-        for key, value in data.items():
-            dref_path = f"{self.LEGS_DREF_PREFIX}{key}"
-            dataref = db.get(dref_path)
-            if dataref is not None:
-                dataref.update_value(value, cascade=False)
-                for listener in dataref.listeners:
-                    if hasattr(listener, "request_render") and hasattr(listener, "compute_value"):
-                        affected_buttons.add(listener)
-
-        # Phase 2: Refresh each affected button once (compute + request_render).
-        t_refresh_start = time.monotonic()
-        for btn in affected_buttons:
-            btn.value = btn.compute_value()
-            if btn.has_changed():
-                btn.request_render()
-        refresh_ms = (time.monotonic() - t_refresh_start) * 1000
-
-        logger.warning(
-            f"LATENCY_LEGS handler: parse={parse_ms:.1f}ms refresh_{len(affected_buttons)}btns={refresh_ms:.0f}ms"
-        )
-        return True
-
     def run(self, just_do_it: bool = False) -> bool:
         if just_do_it:
             if self.sim is None:
                 logger.warning("no simulator")
                 return False
 
-            # Intercept the legs snapshot dataref — handle atomically
-            if self.dataref_path == self.LEGS_SNAPSHOT_DREF:
-                t_start = time.monotonic()
-                queue_wait_ms = (t_start - self._created_at) * 1000
-                logger.warning(f"LATENCY_LEGS T1 event_start queue_wait_ms={queue_wait_ms:.0f}")
-                self.handling()
-                result = self._handle_legs_snapshot()
-                self.handled()
-                handler_ms = (time.monotonic() - t_start) * 1000
-                logger.warning(f"LATENCY_LEGS T2 event_end handler_ms={handler_ms:.0f}")
-                return result
-
-            # should be: dataref = self.sim.get_variable(self.dataref_path)
             dataref = self.sim.cockpit.variable_database.get(self.dataref_path)
             if dataref is None:
                 logger.debug(f"dataref {self.dataref_path} not found in database")
                 return False
 
-            # Skip individual legs datarefs — the snapshot handles them atomically
-            if self.dataref_path.startswith(self.LEGS_DREF_PREFIX):
-                try:
-                    dataref.update_value(self.value, cascade=False)
-                except:
-                    pass
-                return True
-
             try:
                 logger.debug(f"updating {dataref.name}..")
                 self.handling()
-                changed = dataref.update_value(self.value, cascade=self.cascade)
+                dataref.update_value(self.value, cascade=self.cascade)
                 self.handled()
                 logger.debug("..updated")
             except:
@@ -1344,10 +1277,6 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
         cascade = dataref in self.simulator_variable_to_monitor
         frequency = self.get_frequency(dataref)
         if frequency is None or frequency <= 0:
-            if dataref == DatarefEvent.LEGS_SNAPSHOT_DREF:
-                t0 = time.monotonic()
-                self.cockpit._latency_legs_ws_at = t0
-                logger.warning(f"LATENCY_LEGS T0 ws_received t={t0:.3f}")
             self._enqueue_dataref_update(dataref=dataref, value=value, cascade=cascade)
             return
 

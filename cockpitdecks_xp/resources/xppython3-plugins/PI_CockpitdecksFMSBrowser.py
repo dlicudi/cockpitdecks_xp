@@ -112,7 +112,6 @@ class PythonInterface:
 
         self.accessors = []
         self.commands: Dict[str, Dict[str, object]] = {}
-        self.fpl_cmd = None
 
         self.string_values: Dict[str, str] = {
             "plan_name": "No flight plans",
@@ -151,10 +150,29 @@ class PythonInterface:
         self._last_plans_dir_exists: Optional[bool] = None  # set after each full _refresh_plan_list
         self._last_plan_dir_check_monotonic: float = 0.0
         self.PLAN_DIR_POLL_MIN_INTERVAL_SEC = 0.25
+        self._perf_enabled = True
+        self._perf_row_reads = 0
+        self._perf_row_read_time_ms = 0.0
+        self._perf_row_read_log_at = time.monotonic()
+        self._perf_ensure_debounce_skips = 0
+        self._perf_ensure_last_log_at = time.monotonic()
+        self._list_rows_cache: Dict[int, Dict[str, object]] = {}
+        self._list_cache_valid = False
 
     def _log(self, *parts):
         if self.trace:
             print(self.info, *parts)
+
+    def _perf_log(self, *parts):
+        # Inside X-Plane only. Use SDK logging so lines reliably land in Log.txt / XPPython3Log.txt
+        # (plain print() is not consistently captured the same way as trace _log output).
+        if not self._perf_enabled:
+            return
+        line = f"{self.info} [perf] " + " ".join(str(p) for p in parts) + "\n"
+        try:
+            xp.debugString(line)
+        except Exception:
+            print(self.info, "[perf]", *parts)
 
     def XPluginStart(self):
         self._log("XPluginStart", f"LEGS_VISIBLE_ROWS={self.LEGS_VISIBLE_ROWS}")
@@ -208,9 +226,6 @@ class PythonInterface:
 
         self._register_plan_list_window_drefs()
         self._create_plan_list_window_commands()
-
-        self.fpl_cmd = xp.findCommand("sim/GPS/g1000n1_fpl")
-        self._log("findCommand sim/GPS/g1000n1_fpl ->", self.fpl_cmd)
 
         for mode, (down_cmd, up_cmd) in self.map_range_cmds.items():
             self.map_cmd_refs[mode] = (xp.findCommand(down_cmd), xp.findCommand(up_cmd))
@@ -380,6 +395,7 @@ class PythonInterface:
         return self.plans[self.index]
 
     def _publish_state(self):
+        t0 = time.perf_counter()
         plan = self._selected_plan()
 
         self.int_values["count"] = len(self.plans)
@@ -439,6 +455,7 @@ class PythonInterface:
             f"plan={self.string_values['plan_filename']}",
             f"status={self.string_values['status']}",
         )
+        self._perf_log(f"publish_state_ms={(time.perf_counter() - t0) * 1000.0:.2f}")
 
     def _record_action(self, action: int):
         self.int_values["last_action"] = int(action)
@@ -726,8 +743,29 @@ class PythonInterface:
         return max(0, min(aligned, max_w))
 
     def _plan_list_plan_index_for_row(self, row: int) -> int:
-        """0-based index into self.plans for visible row (1..3), or -1 if empty slot."""
-        self._ensure_plans_fresh_for_read()
+        """0-based index into self.plans for visible row (1..3), or -1 if empty slot.
+
+        Hot path: row drefs are polled frequently on fms_load. We intentionally avoid
+        calling _ensure_plans_fresh_for_read() here to prevent repeated filesystem
+        checks per row/value read. Freshness is maintained by snapshot/page reads and
+        user actions that already trigger ensure/refresh.
+        """
+        t0 = time.perf_counter()
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        self._perf_row_reads += 1
+        self._perf_row_read_time_ms += dt_ms
+        now = time.monotonic()
+        if now - self._perf_row_read_log_at >= 1.0:
+            avg_ms = self._perf_row_read_time_ms / max(self._perf_row_reads, 1)
+            self._perf_log(
+                f"row_reads_per_sec={self._perf_row_reads}",
+                f"row_read_avg_ms={avg_ms:.3f}",
+                f"row_read_total_ms={self._perf_row_read_time_ms:.2f}",
+                f"plans={len(self.plans)}",
+            )
+            self._perf_row_reads = 0
+            self._perf_row_read_time_ms = 0.0
+            self._perf_row_read_log_at = now
         if not self.plans:
             return -1
         idx = self.browser_list_window_start + (row - 1)
@@ -735,17 +773,81 @@ class PythonInterface:
             return -1
         return idx
 
+    def _invalidate_list_cache(self) -> None:
+        self._list_cache_valid = False
+
+    def _ensure_list_cache(self) -> None:
+        if self._list_cache_valid:
+            return
+        t0 = time.perf_counter()
+        rows: Dict[int, Dict[str, object]] = {}
+        n = len(self.plans)
+        w = self.browser_list_window_start
+        page = w // self.PLAN_LIST_VISIBLE_ROWS + 1 if n else 0
+        page_count = (n + self.PLAN_LIST_VISIBLE_ROWS - 1) // self.PLAN_LIST_VISIBLE_ROWS if n else 0
+
+        for row in range(1, self.PLAN_LIST_VISIBLE_ROWS + 1):
+            pi = w + (row - 1)
+            if pi < 0 or pi >= n:
+                rows[row] = {
+                    "plan_index": -1,
+                    "index": "",
+                    "filename": "",
+                    "timestamp": "",
+                    "dep": "",
+                    "dest": "",
+                    "route": "",
+                    "wpt_count": 0,
+                    "max_alt_ft": 0,
+                    "distance_nm": 0.0,
+                    "is_selected": 0,
+                    "status": "",
+                }
+                continue
+
+            plan = self.plans[pi]
+            dep = (plan.dep or "").strip()
+            dep = "" if (not dep or dep == "----") else dep
+            dest = (plan.dest or "").strip()
+            dest = "" if (not dest or dest == "----") else dest
+            if dep and dest:
+                route = f"{dep} {dest}"
+            else:
+                route = dep or dest
+            is_selected = int(self.index >= 0 and pi == self.index)
+            rows[row] = {
+                "plan_index": pi,
+                "index": str(pi + 1),
+                "filename": os.path.splitext(plan.filename)[0],
+                "timestamp": self._format_file_timestamp(plan.file_timestamp),
+                "dep": dep,
+                "dest": dest,
+                "route": route,
+                "wpt_count": int(plan.waypoint_count),
+                "max_alt_ft": int(plan.max_altitude),
+                "distance_nm": float(plan.total_distance_nm),
+                "is_selected": is_selected,
+                "status": "SEL" if is_selected else "",
+            }
+
+        self._list_rows_cache = rows
+        self._list_cache_valid = True
+        self._perf_log(
+            f"list_cache_rebuild_ms={(time.perf_counter() - t0) * 1000.0:.2f}",
+            f"plans={n}",
+            f"selected={self.index}",
+            f"window_start={w}",
+            f"page={page}",
+            f"page_count={page_count}",
+        )
+
     def _plan_list_read_row_plan_index(self, row: int) -> str:
-        pi = self._plan_list_plan_index_for_row(row)
-        if pi < 0:
-            return ""
-        return str(pi + 1)
+        self._ensure_list_cache()
+        return str(self._list_rows_cache.get(row, {}).get("index", ""))
 
     def _plan_list_read_row_filename(self, row: int) -> str:
-        pi = self._plan_list_plan_index_for_row(row)
-        if pi < 0:
-            return ""
-        return os.path.splitext(self.plans[pi].filename)[0]
+        self._ensure_list_cache()
+        return str(self._list_rows_cache.get(row, {}).get("filename", ""))
 
     def _format_file_timestamp(self, ts: float) -> str:
         if ts <= 0:
@@ -756,66 +858,42 @@ class PythonInterface:
             return ""
 
     def _plan_list_read_row_timestamp(self, row: int) -> str:
-        pi = self._plan_list_plan_index_for_row(row)
-        if pi < 0:
-            return ""
-        return self._format_file_timestamp(self.plans[pi].file_timestamp)
+        self._ensure_list_cache()
+        return str(self._list_rows_cache.get(row, {}).get("timestamp", ""))
 
     def _plan_list_read_row_dep(self, row: int) -> str:
-        pi = self._plan_list_plan_index_for_row(row)
-        if pi < 0:
-            return ""
-        d = (self.plans[pi].dep or "").strip()
-        if not d or d == "----":
-            return ""
-        return d
+        self._ensure_list_cache()
+        return str(self._list_rows_cache.get(row, {}).get("dep", ""))
 
     def _plan_list_read_row_dest(self, row: int) -> str:
-        pi = self._plan_list_plan_index_for_row(row)
-        if pi < 0:
-            return ""
-        d = (self.plans[pi].dest or "").strip()
-        if not d or d == "----":
-            return ""
-        return d
+        self._ensure_list_cache()
+        return str(self._list_rows_cache.get(row, {}).get("dest", ""))
 
     def _plan_list_read_row_route(self, row: int) -> str:
         """DEP ARR for annunciator second segment (single line)."""
-        dep = self._plan_list_read_row_dep(row)
-        dest = self._plan_list_read_row_dest(row)
-        if not dep and not dest:
-            return ""
-        if dep and dest:
-            return f"{dep} {dest}"
-        return dep or dest
+        self._ensure_list_cache()
+        return str(self._list_rows_cache.get(row, {}).get("route", ""))
 
     def _plan_list_read_row_wpt_count(self, row: int) -> int:
-        pi = self._plan_list_plan_index_for_row(row)
-        if pi < 0:
-            return 0
-        return int(self.plans[pi].waypoint_count)
+        self._ensure_list_cache()
+        return int(self._list_rows_cache.get(row, {}).get("wpt_count", 0))
 
     def _plan_list_read_row_max_alt_ft(self, row: int) -> int:
         """Max waypoint altitude in the .fms file (ft MSL), 0 if row empty or no points."""
-        pi = self._plan_list_plan_index_for_row(row)
-        if pi < 0:
-            return 0
-        return int(self.plans[pi].max_altitude)
+        self._ensure_list_cache()
+        return int(self._list_rows_cache.get(row, {}).get("max_alt_ft", 0))
 
     def _plan_list_read_row_distance_nm(self, row: int) -> float:
-        pi = self._plan_list_plan_index_for_row(row)
-        if pi < 0:
-            return 0.0
-        return float(self.plans[pi].total_distance_nm)
+        self._ensure_list_cache()
+        return float(self._list_rows_cache.get(row, {}).get("distance_nm", 0.0))
 
     def _plan_list_read_row_is_selected(self, row: int) -> int:
-        pi = self._plan_list_plan_index_for_row(row)
-        if pi < 0 or self.index < 0:
-            return 0
-        return 1 if pi == self.index else 0
+        self._ensure_list_cache()
+        return int(self._list_rows_cache.get(row, {}).get("is_selected", 0))
 
     def _plan_list_read_row_status(self, row: int) -> str:
-        return "SEL" if self._plan_list_read_row_is_selected(row) else ""
+        self._ensure_list_cache()
+        return str(self._list_rows_cache.get(row, {}).get("status", ""))
 
     def _plan_list_read_page_indicator(self) -> str:
         self._ensure_plans_fresh_for_read()
@@ -848,25 +926,15 @@ class PythonInterface:
         self._ensure_plans_fresh_for_read()
         return "DESC" if self.plan_sort_desc else "ASC"
 
-    def _plan_list_read_snapshot(self) -> str:
-        """JSON bundle for encoder dataref (same role as fms_legs/snapshot on fms_fpl E0)."""
-        import json
+    def _plan_list_read_window_page(self) -> int:
+        """1-based plan-list page (rows 1–3 = page 1, etc.); same stepping idea as fms_legs/window_start."""
         self._ensure_plans_fresh_for_read()
         n = len(self.plans)
-        data = {
-            "window_start": self.browser_list_window_start,
-            "plan_count": n,
-            "selected_plan_index": self.index,
-            "sort_key": self.plan_sort_key,
-            "sort_desc": int(self.plan_sort_desc),
-            "page": self.browser_list_window_start // self.PLAN_LIST_VISIBLE_ROWS + 1 if n else 0,
-            "page_count": (n + self.PLAN_LIST_VISIBLE_ROWS - 1) // self.PLAN_LIST_VISIBLE_ROWS if n else 0,
-        }
-        for row in range(1, self.PLAN_LIST_VISIBLE_ROWS + 1):
-            pi = self._plan_list_plan_index_for_row(row)
-            data[f"row_{row}_list_index"] = self._plan_list_read_row_plan_index(row)
-            data[f"row_{row}_is_selected"] = int(pi >= 0 and self.index >= 0 and pi == self.index)
-        return json.dumps(data, separators=(",", ":"))
+        if n <= 0:
+            return 1
+        w = self.browser_list_window_start
+        page = w // self.PLAN_LIST_VISIBLE_ROWS + 1
+        return max(1, int(page))
 
     def _register_plan_list_window_drefs(self):
         p = self.DREF_PREFIX
@@ -875,7 +943,7 @@ class PythonInterface:
         self._register_live_string_dref("list_sort_key", self._plan_list_read_sort_key_label, prefix=p)
         self._register_live_string_dref("list_sort_direction", self._plan_list_read_sort_dir_label, prefix=p)
         self._register_live_string_dref("list_sort_mode", self._plan_list_read_sort_key_label, prefix=p)
-        self._register_live_string_dref("list_snapshot", self._plan_list_read_snapshot, prefix=p)
+        self._register_live_int_dref("list_window_page", self._plan_list_read_window_page, prefix=p)
         for row in range(1, self.PLAN_LIST_VISIBLE_ROWS + 1):
             self._register_live_string_dref(
                 f"list_row_{row}_index", lambda r=row: self._plan_list_read_row_plan_index(r), prefix=p)
@@ -981,6 +1049,7 @@ class PythonInterface:
         self._ensure_plans_fresh_for_read(force=True)
         if not self.plans:
             self._set_status("EMPTY")
+            self._invalidate_list_cache()
             self._publish_state()
             return
 
@@ -1002,6 +1071,7 @@ class PythonInterface:
         sort_key = "NAME" if self.plan_sort_key == 0 else "DATE"
         sort_dir = "DESC" if self.plan_sort_desc else "ASC"
         self._set_status(f"SORT {sort_key} {sort_dir}")
+        self._invalidate_list_cache()
         self._publish_state()
 
     def _cmd_list_sort_filename(self):
@@ -1042,6 +1112,7 @@ class PythonInterface:
         if new_start != self.browser_list_window_start:
             self.browser_list_window_start = new_start
             self.index = -1  # like fms_legs: clear selection when paging
+            self._invalidate_list_cache()
             self._log(
                 "list_scroll_up: page",
                 self.browser_list_window_start // self.PLAN_LIST_VISIBLE_ROWS + 1,
@@ -1062,6 +1133,7 @@ class PythonInterface:
         if new_start != self.browser_list_window_start:
             self.browser_list_window_start = new_start
             self.index = -1  # like fms_legs: clear selection when paging
+            self._invalidate_list_cache()
             self._log(
                 "list_scroll_down: page",
                 self.browser_list_window_start // self.PLAN_LIST_VISIBLE_ROWS + 1,
@@ -1091,6 +1163,7 @@ class PythonInterface:
         else:
             self.index = pi
             self._log("list_select_row", row, "-> plan index", pi)
+        self._invalidate_list_cache()
         self._set_status("READY")
         self._publish_state()
 
@@ -1132,13 +1205,23 @@ class PythonInterface:
         if not force:
             now = time.monotonic()
             if now - self._last_plan_dir_check_monotonic < self.PLAN_DIR_POLL_MIN_INTERVAL_SEC:
+                self._perf_ensure_debounce_skips += 1
+                if now - self._perf_ensure_last_log_at >= 1.0:
+                    self._perf_log(
+                        f"ensure_debounce_skips_per_sec={self._perf_ensure_debounce_skips}",
+                        f"poll_interval_s={self.PLAN_DIR_POLL_MIN_INTERVAL_SEC:.2f}",
+                    )
+                    self._perf_ensure_debounce_skips = 0
+                    self._perf_ensure_last_log_at = now
                 return
             self._last_plan_dir_check_monotonic = now
 
         if self._last_plans_dir_exists is None:
+            self._perf_log("ensure_refresh_trigger=initial_probe")
             self._refresh_plan_list()
             return
         if exists != self._last_plans_dir_exists:
+            self._perf_log(f"ensure_refresh_trigger=dir_exists_change old={self._last_plans_dir_exists} new={exists}")
             self._refresh_plan_list()
             return
         if not exists:
@@ -1148,17 +1231,25 @@ class PythonInterface:
             snapshot = self._current_fms_snapshot_tuple(plans_dir)
         except OSError as exc:
             self._log("ensure_plans_fresh: listdir failed", plans_dir, exc)
+            self._perf_log("ensure_snapshot_error", str(exc))
             return
 
         if snapshot != self._fms_names_snapshot:
+            self._perf_log(
+                "ensure_refresh_trigger=snapshot_changed",
+                f"old_count={len(self._fms_names_snapshot)}",
+                f"new_count={len(snapshot)}",
+            )
             self._refresh_plan_list()
 
     def _refresh_plan_list(self):
+        t_total_0 = time.perf_counter()
         plans_dir = self._plans_dir()
         self._log("Refreshing plans from", plans_dir)
 
         self.plans = []
         self.loaded = 0
+        self._invalidate_list_cache()
 
         if not os.path.isdir(plans_dir):
             self._fms_names_snapshot = ()
@@ -1166,10 +1257,12 @@ class PythonInterface:
             self.browser_list_window_start = 0
             self.index = -1
             self._set_status("NO DIR", f"Missing folder: {plans_dir}")
+            self._invalidate_list_cache()
             self._publish_state()
             return
 
         self._last_plans_dir_exists = True
+        t_scan_0 = time.perf_counter()
         filenames = []
         with os.scandir(plans_dir) as it:
             for entry in it:
@@ -1177,14 +1270,19 @@ class PythonInterface:
                     filenames.append(entry.name)
         filenames.sort()
         self._fms_names_snapshot = self._current_fms_snapshot_tuple(plans_dir)
+        t_scan_ms = (time.perf_counter() - t_scan_0) * 1000.0
 
+        t_parse_0 = time.perf_counter()
         for filename in filenames:
             full_path = os.path.join(plans_dir, filename)
             info = self._parse_fms_file(full_path)
             if info is not None:
                 self.plans.append(info)
+        t_parse_ms = (time.perf_counter() - t_parse_0) * 1000.0
 
+        t_sort_0 = time.perf_counter()
         self._sort_plans()
+        t_sort_ms = (time.perf_counter() - t_sort_0) * 1000.0
 
         if not self.plans:
             self.index = -1
@@ -1196,7 +1294,19 @@ class PythonInterface:
             self.browser_list_window_start = self._plan_list_align_window_start(
                 self.browser_list_window_start, len(self.plans))
             self._set_status("READY")
+        self._invalidate_list_cache()
+        t_publish_0 = time.perf_counter()
         self._publish_state()
+        t_publish_ms = (time.perf_counter() - t_publish_0) * 1000.0
+        self._perf_log(
+            f"refresh_total_ms={(time.perf_counter() - t_total_0) * 1000.0:.2f}",
+            f"scan_ms={t_scan_ms:.2f}",
+            f"parse_ms={t_parse_ms:.2f}",
+            f"sort_ms={t_sort_ms:.2f}",
+            f"publish_ms={t_publish_ms:.2f}",
+            f"files={len(filenames)}",
+            f"plans={len(self.plans)}",
+        )
 
     @staticmethod
     def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -1344,6 +1454,7 @@ class PythonInterface:
         self._ensure_plans_fresh_for_read()
         if not self.plans:
             self._set_status("EMPTY")
+            self._invalidate_list_cache()
             self._publish_state()
             return
 
@@ -1351,6 +1462,7 @@ class PythonInterface:
         end = min(start + self.PLAN_LIST_VISIBLE_ROWS, len(self.plans))
         if end <= start:
             self._set_status("READY")
+            self._invalidate_list_cache()
             self._publish_state()
             return
 
@@ -1362,6 +1474,7 @@ class PythonInterface:
                 self.index = start
 
         self._set_status("READY")
+        self._invalidate_list_cache()
         self._publish_state()
 
     def _cmd_next(self):
@@ -1369,6 +1482,7 @@ class PythonInterface:
         self._ensure_plans_fresh_for_read()
         if not self.plans:
             self._set_status("EMPTY")
+            self._invalidate_list_cache()
             self._publish_state()
             return
 
@@ -1376,6 +1490,7 @@ class PythonInterface:
         end = min(start + self.PLAN_LIST_VISIBLE_ROWS, len(self.plans))
         if end <= start:
             self._set_status("READY")
+            self._invalidate_list_cache()
             self._publish_state()
             return
 
@@ -1387,6 +1502,7 @@ class PythonInterface:
                 self.index = end - 1
 
         self._set_status("READY")
+        self._invalidate_list_cache()
         self._publish_state()
 
     def _cmd_refresh(self):
@@ -1434,33 +1550,16 @@ class PythonInterface:
         self._publish_state()
 
     def _cmd_open_fpl(self):
-        if self.fpl_cmd:
+        cmd = xp.findCommand("sim/GPS/g1000n1_fpl")
+        if cmd:
             self._log("Executing sim/GPS/g1000n1_fpl")
-            xp.commandOnce(self.fpl_cmd)
+            xp.commandOnce(cmd)
             self._set_status("FPL OPEN")
         else:
             self._set_status("NO FPL CMD", "sim/GPS/g1000n1_fpl not found")
         self._publish_state()
 
     # ── LEGS scrollable list ──────────────────────────────────
-
-    def _legs_read_snapshot(self) -> str:
-        """Build a JSON snapshot of all legs state — one dataref = one atomic WS push."""
-        import json
-        data = {
-            "selected_index": self._legs_read_selected_index(),
-            "active_index": self._legs_read_active_index(),
-            "entry_count": self._legs_read_entry_count(),
-            "window_start": self._legs_read_window_start(),
-        }
-        for row in range(1, self.LEGS_VISIBLE_ROWS + 1):
-            data[f"row_{row}_index"] = self._legs_read_row_index(row)
-            data[f"row_{row}_ident"] = self._legs_read_row_ident(row)
-            data[f"row_{row}_alt"] = self._legs_read_row_alt(row)
-            data[f"row_{row}_is_active"] = self._legs_read_row_is_active(row)
-            data[f"row_{row}_is_selected"] = self._legs_read_row_is_selected(row)
-            data[f"row_{row}_status"] = self._legs_read_row_status(row)
-        return json.dumps(data, separators=(",", ":"))
 
     def _register_legs_drefs(self):
         p = self.LEGS_DREF_PREFIX
@@ -1485,8 +1584,6 @@ class PythonInterface:
                 f"row_{row}_is_selected", lambda r=row: self._legs_read_row_is_selected(r), prefix=p)
             self._register_live_string_dref(
                 f"row_{row}_status", lambda r=row: self._legs_read_row_status(r), prefix=p)
-        # Single JSON snapshot — all legs data in one WS push
-        self._register_live_string_dref("snapshot", self._legs_read_snapshot, prefix=p)
 
     def _create_legs_commands(self):
         p = self.LEGS_CMD_PREFIX
