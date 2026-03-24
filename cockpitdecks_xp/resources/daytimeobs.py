@@ -73,13 +73,19 @@ class DaytimeObservable(Observable, SimulatorVariableListener):
 
         days = self.sim.get_simulator_variable_value(LOCAL_DATE)
         if days is None:
-            logger.warning("no days since new year")
+            if self._no_date_warning:
+                logger.debug("no days since new year")
+            else:
+                logger.warning("no days since new year")
             self._no_date_warning = True
             return
 
         secs = self.sim.get_simulator_variable_value(ZULU_TIME_SEC)
         if secs is None:
-            logger.warning("no seconds since midnight")
+            if self._no_date_warning:
+                logger.debug("no seconds since midnight")
+            else:
+                logger.warning("no seconds since midnight")
             self._no_date_warning = True
             return
 
