@@ -194,6 +194,53 @@ class DatarefEvent(SimulatorEvent):
         return True
 
 
+class DatarefBatchEvent(SimulatorEvent):
+    """Batch Dataref Update Event
+
+    Processes all dataref updates from a single WebSocket message in one event loop tick.
+    First updates all values (without cascade), then notifies listeners once per affected button.
+    """
+
+    def __init__(self, sim: Simulator, updates: list, autorun: bool = True):
+        self.updates = updates  # list of (dataref_path, value) tuples
+        SimulatorEvent.__init__(self, sim=sim, autorun=autorun)
+
+    def __str__(self):
+        return f"{self.sim.name}:batch({len(self.updates)}):{self.timestamp}"
+
+    def info(self):
+        return super().info() | {"batch_size": len(self.updates)}
+
+    def run(self, just_do_it: bool = False) -> bool:
+        if just_do_it:
+            if self.sim is None:
+                logger.warning("no simulator")
+                return False
+            self.handling()
+            vdb = self.sim.cockpit.variable_database
+            monitor = self.sim.simulator_variable_to_monitor
+            changed_variables = []
+            for dataref_path, value in self.updates:
+                dataref = vdb.get(dataref_path)
+                if dataref is None:
+                    logger.debug(f"dataref {dataref_path} not found in database")
+                    continue
+                cascade = dataref_path in monitor
+                # Update value but suppress notification — we'll notify in bulk below
+                changed = dataref.update_value(value, cascade=False)
+                if changed and cascade:
+                    changed_variables.append(dataref)
+            # Now notify listeners once per changed variable
+            for dataref in changed_variables:
+                dataref.notify()
+            self.handled()
+            logger.debug(f"batch updated {len(self.updates)} datarefs, {len(changed_variables)} changed")
+        else:
+            self.enqueue()
+            logger.debug("batch enqueued")
+        return True
+
+
 # #############################################
 # Instructions
 #
@@ -673,7 +720,7 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
 
         XPWebsocketAPI.__init__(self, host=self.api_host, port=ws_port, api=self.api_path, api_version=self.api_version, use_rest=USE_REST)
         # XPWebsocketAPI callbacks
-        self.add_callback(cbtype=CALLBACK_TYPE.ON_DATAREF_UPDATE, callback=self.dataref_newvalue_callback)
+        self.add_callback(cbtype=CALLBACK_TYPE.ON_DATAREF_UPDATE_BATCH, callback=self.dataref_batch_callback)
         self.add_callback(cbtype=CALLBACK_TYPE.ON_COMMAND_ACTIVE, callback=self.command_active_callback)
         self.add_callback(cbtype=CALLBACK_TYPE.ON_OPEN, callback=self._on_ws_open)
         self.add_callback(cbtype=CALLBACK_TYPE.ON_CLOSE, callback=self._on_ws_close)
@@ -1273,8 +1320,16 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
     def status_info(self) -> str:
         return f"beacon={self._beacon.status_str}, api={self.status_str}, simulator={self.x_plane_status_str}"
 
+    def dataref_batch_callback(self, updates: list):
+        """Called with all dataref updates from a single WebSocket message."""
+        DatarefBatchEvent(sim=self, updates=updates)
+        self.inc(COCKPITDECKS_INTVAR.UPDATE_ENQUEUED.value, len(updates))
+        XPWebsocketAPI.inc(self, "batch_events")
+
     def dataref_newvalue_callback(self, dataref: str, value):
         cascade = dataref in self.simulator_variable_to_monitor
+        if not cascade:
+            logger.log(SPAM_LEVEL, f"dataref {dataref} not in simulator_variable_to_monitor, cascade=False")
         frequency = self.get_frequency(dataref)
         if frequency is None or frequency <= 0:
             self._enqueue_dataref_update(dataref=dataref, value=value, cascade=cascade)
@@ -1322,6 +1377,7 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
     def _enqueue_dataref_update(self, dataref: str, value, cascade: bool):
         DatarefEvent(sim=self, dataref=dataref, value=value, cascade=cascade)
         self.inc(COCKPITDECKS_INTVAR.UPDATE_ENQUEUED.value)
+        self.inc("cascade_true" if cascade else "cascade_false")
 
     def command_active_callback(self, command: str, active: bool):
         # print(f"CMD  {command}={active}")
