@@ -46,7 +46,7 @@ class PythonInterface:
         "same 3-row paging as fms_legs on fms_fpl. "
         "Encoder commands order (Cockpitdecks): [0]=CCW→list_scroll_up, [1]=CW→list_scroll_down — same as fms_fpl E0."
     )
-    RELEASE = "2.0.18"
+    RELEASE = "2.0.20"
 
     DREF_PREFIX = "cockpitdecks/fms_browser"
     CMD_PREFIX = "cockpitdecks/fms_browser"
@@ -57,6 +57,8 @@ class PythonInterface:
 
     # Plan file browser: 3 visible rows (Loupedeck Live 4×3), same paging idea as fms_legs
     PLAN_LIST_VISIBLE_ROWS = 3
+    # Maximum plans loaded — always the N most recent by file modification time.
+    PLAN_LIST_MAX_PLANS = 9
 
     ACTION_NONE = 0
     ACTION_PREVIOUS = 1
@@ -145,19 +147,15 @@ class PythonInterface:
             "loaded_distance_nm": 0.0,
         }
 
-        # FPL catalog: rescan disk when the set of .fms filenames changes (debounced on dataref reads).
-        self._fms_names_snapshot: tuple = ()
-        self._last_plans_dir_exists: Optional[bool] = None  # set after each full _refresh_plan_list
-        self._last_plan_dir_check_monotonic: float = 0.0
-        self.PLAN_DIR_POLL_MIN_INTERVAL_SEC = 0.25
         self._perf_enabled = True
         self._perf_row_reads = 0
         self._perf_row_read_time_ms = 0.0
         self._perf_row_read_log_at = time.monotonic()
-        self._perf_ensure_debounce_skips = 0
-        self._perf_ensure_last_log_at = time.monotonic()
         self._list_rows_cache: Dict[int, Dict[str, object]] = {}
         self._list_cache_valid = False
+        # Cache for parsed FMS entries, keyed by (filename, mtime_ns, size).
+        # Avoids re-reading every .fms file on the REFRESH command when files haven't changed.
+        self._entry_parse_cache: Dict[tuple, list] = {}
 
     def _log(self, *parts):
         if self.trace:
@@ -177,18 +175,17 @@ class PythonInterface:
     def XPluginStart(self):
         self._log("XPluginStart", f"LEGS_VISIBLE_ROWS={self.LEGS_VISIBLE_ROWS}")
 
-        _plan_sync = True
-        self._register_string_dref("plan_name", sync_plans=_plan_sync)
-        self._register_string_dref("plan_departure", sync_plans=_plan_sync)
-        self._register_string_dref("plan_destination", sync_plans=_plan_sync)
-        self._register_string_dref("plan_cycle", sync_plans=_plan_sync)
-        self._register_string_dref("plan_filename", sync_plans=_plan_sync)
-        self._register_string_dref("plan_path", sync_plans=_plan_sync)
-        self._register_string_dref("plan_dep_runway", sync_plans=_plan_sync)
-        self._register_string_dref("plan_dest_runway", sync_plans=_plan_sync)
-        self._register_string_dref("plan_sid", sync_plans=_plan_sync)
-        self._register_string_dref("plan_star", sync_plans=_plan_sync)
-        self._register_string_dref("plan_waypoints", sync_plans=_plan_sync)
+        self._register_string_dref("plan_name")
+        self._register_string_dref("plan_departure")
+        self._register_string_dref("plan_destination")
+        self._register_string_dref("plan_cycle")
+        self._register_string_dref("plan_filename")
+        self._register_string_dref("plan_path")
+        self._register_string_dref("plan_dep_runway")
+        self._register_string_dref("plan_dest_runway")
+        self._register_string_dref("plan_sid")
+        self._register_string_dref("plan_star")
+        self._register_string_dref("plan_waypoints")
         self._register_string_dref("status")
         self._register_string_dref("last_error")
         self._register_string_dref("loaded_filename")
@@ -196,17 +193,17 @@ class PythonInterface:
         self._register_string_dref("loaded_star")
         self._register_string_dref("map_mode")
 
-        self._register_int_dref("index", sync_plans=True)
-        self._register_int_dref("count", sync_plans=True)
+        self._register_int_dref("index")
+        self._register_int_dref("count")
         self._register_int_dref("loaded")
         self._register_int_dref("loaded_index")
         self._register_writable_action_dref("action")
         self._register_int_dref("last_action")
         self._register_int_dref("action_ack")
-        self._register_int_dref("plan_waypoint_count", sync_plans=True)
-        self._register_int_dref("plan_max_altitude", sync_plans=True)
+        self._register_int_dref("plan_waypoint_count")
+        self._register_int_dref("plan_max_altitude")
 
-        self._register_float_dref("plan_distance_nm", sync_plans=True)
+        self._register_float_dref("plan_distance_nm")
         self._register_float_dref("loaded_distance_nm")
 
         self._register_live_fms_drefs()
@@ -218,6 +215,7 @@ class PythonInterface:
         self._create_command("open_fpl", "Open G1000 FPL page", self._cmd_open_fpl)
         self._create_command("wp_next", "Display next FMS waypoint", self._cmd_wp_next)
         self._create_command("wp_previous", "Display previous FMS waypoint", self._cmd_wp_previous)
+        self._create_command("wp_activate", "Activate displayed FMS waypoint", self._cmd_wp_activate)
         self._create_command("wp_direct", "Direct-to displayed FMS waypoint", self._cmd_wp_direct)
         self._create_command("clear_fms_entry", "Clear displayed FMS entry", self._cmd_clear_fms_entry)
         self._create_command("map_range_down", "Map range zoom in", self._cmd_map_range_down)
@@ -274,12 +272,10 @@ class PythonInterface:
             self._publish_state()
         return None
 
-    def _register_string_dref(self, suffix: str, sync_plans: bool = False):
+    def _register_string_dref(self, suffix: str):
         name = f"{self.DREF_PREFIX}/{suffix}"
 
         def read_data(refCon, values, offset, count):
-            if sync_plans:
-                self._ensure_plans_fresh_for_read()
             text = self.string_values.get(suffix, "")
             data = list(text.encode("utf-8"))
             if values is None:
@@ -299,12 +295,10 @@ class PythonInterface:
         self.accessors.append(accessor)
         self._log("Registered string dataref", name, "->", accessor)
 
-    def _register_int_dref(self, suffix: str, sync_plans: bool = False):
+    def _register_int_dref(self, suffix: str):
         name = f"{self.DREF_PREFIX}/{suffix}"
 
         def read_int(refCon):
-            if sync_plans:
-                self._ensure_plans_fresh_for_read()
             return int(self.int_values.get(suffix, 0))
 
         accessor = xp.registerDataAccessor(
@@ -317,12 +311,10 @@ class PythonInterface:
         self.accessors.append(accessor)
         self._log("Registered int dataref", name, "->", accessor)
 
-    def _register_float_dref(self, suffix: str, sync_plans: bool = False):
+    def _register_float_dref(self, suffix: str):
         name = f"{self.DREF_PREFIX}/{suffix}"
 
         def read_float(refCon):
-            if sync_plans:
-                self._ensure_plans_fresh_for_read()
             return float(self.float_values.get(suffix, 0.0))
 
         accessor = xp.registerDataAccessor(
@@ -680,7 +672,7 @@ class PythonInterface:
         except Exception as exc:
             self._log("wp_previous error:", exc)
 
-    def _cmd_wp_direct(self):
+    def _cmd_wp_activate(self):
         try:
             count = xp.countFMSEntries()
             if count <= 0:
@@ -689,7 +681,25 @@ class PythonInterface:
             xp.setDestinationFMSEntry(displayed)
             info = self._safe_fms_entry_info(displayed)
             ident = info.navAidID if info else "?"
-            self._log("wp_direct: destination set to", displayed, ident)
+            self._log("wp_activate: destination set to", displayed, ident)
+        except Exception as exc:
+            self._log("wp_activate error:", exc)
+
+    def _cmd_wp_direct(self):
+        try:
+            count = xp.countFMSEntries()
+            if count <= 0:
+                return
+            displayed = xp.getDisplayedFMSEntry()
+            fp = getattr(xp, "FMSFlightPlan_Active", getattr(xp, "ActiveFlightPlan", 0))
+            if hasattr(xp, "setDirectToFMSFlightPlanEntry"):
+                xp.setDirectToFMSFlightPlanEntry(fp, displayed)
+            else:
+                self._log("wp_direct: API xp.setDirectToFMSFlightPlanEntry not available (XP12 feature)")
+                return
+            info = self._safe_fms_entry_info(displayed)
+            ident = info.navAidID if info else "?"
+            self._log("wp_direct: direct-to set to", displayed, ident)
         except Exception as exc:
             self._log("wp_direct error:", exc)
 
@@ -745,10 +755,8 @@ class PythonInterface:
     def _plan_list_plan_index_for_row(self, row: int) -> int:
         """0-based index into self.plans for visible row (1..3), or -1 if empty slot.
 
-        Hot path: row drefs are polled frequently on fms_load. We intentionally avoid
-        calling _ensure_plans_fresh_for_read() here to prevent repeated filesystem
-        checks per row/value read. Freshness is maintained by snapshot/page reads and
-        user actions that already trigger ensure/refresh.
+        Hot path: row drefs are polled frequently on fms_load. Plans are loaded once
+        on startup/plane-load or on explicit REFRESH — no filesystem checks here.
         """
         t0 = time.perf_counter()
         dt_ms = (time.perf_counter() - t0) * 1000.0
@@ -883,20 +891,31 @@ class PythonInterface:
         self._ensure_list_cache()
         return int(self._list_rows_cache.get(row, {}).get("max_alt_ft", 0))
 
-    def _plan_list_read_row_distance_nm(self, row: int) -> float:
-        self._ensure_list_cache()
-        return float(self._list_rows_cache.get(row, {}).get("distance_nm", 0.0))
+    def _plan_list_read_selected_row_logged(self) -> int:
+        val = self._plan_list_read_selected_row()
+        xp.log(f"FMS BROWSER TRACE: list_selected_row = {val}")
+        return val
 
-    def _plan_list_read_row_is_selected(self, row: int) -> int:
+    def _plan_list_read_selected_row(self) -> int:
+        w = self.browser_list_window_start
+        n = len(self.plans)
+        if self.index >= 0 and 0 <= self.index < n:
+            row_on_page = self.index - w + 1
+            if 1 <= row_on_page <= self.PLAN_LIST_VISIBLE_ROWS:
+                res = int(row_on_page)
+                self._log("POLL list_selected_row ->", res)
+                return res
+        return 0
+
+    def _plan_list_read_row_distance_nm(self, row: int) -> int:
         self._ensure_list_cache()
-        return int(self._list_rows_cache.get(row, {}).get("is_selected", 0))
+        return int(round(self._list_rows_cache.get(row, {}).get("distance_nm", 0.0)))
 
     def _plan_list_read_row_status(self, row: int) -> str:
         self._ensure_list_cache()
         return str(self._list_rows_cache.get(row, {}).get("status", ""))
 
     def _plan_list_read_page_indicator(self) -> str:
-        self._ensure_plans_fresh_for_read()
         n = len(self.plans)
         if n <= 0:
             return ""
@@ -906,7 +925,6 @@ class PythonInterface:
 
     def _plan_list_read_selected_over_count(self) -> str:
         """SEL on LOAD: which of the 3 visible rows is selected (1–3), not global plan index."""
-        self._ensure_plans_fresh_for_read()
         nrows = self.PLAN_LIST_VISIBLE_ROWS
         if not self.plans:
             return "0/0"
@@ -919,16 +937,13 @@ class PythonInterface:
         return f"{row}/{nrows}"
 
     def _plan_list_read_sort_key_label(self) -> str:
-        self._ensure_plans_fresh_for_read()
         return "NAME" if self.plan_sort_key == 0 else "DATE"
 
     def _plan_list_read_sort_dir_label(self) -> str:
-        self._ensure_plans_fresh_for_read()
         return "DESC" if self.plan_sort_desc else "ASC"
 
     def _plan_list_read_window_page(self) -> int:
         """1-based plan-list page (rows 1–3 = page 1, etc.); same stepping idea as fms_legs/window_start."""
-        self._ensure_plans_fresh_for_read()
         n = len(self.plans)
         if n <= 0:
             return 1
@@ -961,12 +976,18 @@ class PythonInterface:
                 f"list_row_{row}_wpt_count", lambda r=row: self._plan_list_read_row_wpt_count(r), prefix=p)
             self._register_live_int_dref(
                 f"list_row_{row}_max_alt_ft", lambda r=row: self._plan_list_read_row_max_alt_ft(r), prefix=p)
-            self._register_live_float_dref(
-                f"list_row_{row}_distance_nm", lambda r=row: self._plan_list_read_row_distance_nm(r), prefix=p)
             self._register_live_int_dref(
-                f"list_row_{row}_is_selected", lambda r=row: self._plan_list_read_row_is_selected(r), prefix=p)
+                f"list_row_{row}_distance_nm", lambda r=row: self._plan_list_read_row_distance_nm(r), prefix=p)
             self._register_live_string_dref(
                 f"list_row_{row}_status", lambda r=row: self._plan_list_read_row_status(r), prefix=p)
+
+        self._register_live_int_dref(
+            "list_selected_row", lambda: self._plan_list_read_selected_row(), prefix=p)
+        for row in range(1, self.PLAN_LIST_VISIBLE_ROWS + 1):
+            self._register_live_int_dref(
+                f"list_row_{row}_is_selected",
+                lambda r=row: 1 if self._plan_list_read_selected_row() == r else 0,
+                prefix=p)
 
     def _register_live_float_dref(self, suffix: str, read_fn, prefix: str = None):
         name = f"{prefix or self.DREF_PREFIX}/{suffix}"
@@ -1046,7 +1067,6 @@ class PythonInterface:
                 self.plans.sort(key=lambda p: (p.file_timestamp, p.filename.lower()))
 
     def _plan_list_apply_sort(self, key: Optional[int] = None, desc: Optional[bool] = None):
-        self._ensure_plans_fresh_for_read(force=True)
         if not self.plans:
             self._set_status("EMPTY")
             self._invalidate_list_cache()
@@ -1105,7 +1125,6 @@ class PythonInterface:
 
     def _cmd_list_scroll_up(self):
         """Previous page: 1-3, 4-6, 7-9, … (same as fms_legs scroll_up)."""
-        self._ensure_plans_fresh_for_read()
         if not self.plans:
             return
         new_start = max(0, self.browser_list_window_start - self.PLAN_LIST_VISIBLE_ROWS)
@@ -1123,7 +1142,6 @@ class PythonInterface:
 
     def _cmd_list_scroll_down(self):
         """Next page: 1-3, 4-6, 7-9, … partial last page (e.g. 5 plans: row3 empty)."""
-        self._ensure_plans_fresh_for_read()
         if not self.plans:
             return
         n = len(self.plans)
@@ -1152,17 +1170,12 @@ class PythonInterface:
         self._cmd_list_select_row(3)
 
     def _cmd_list_select_row(self, row: int):
-        """Tap row to select plan, or tap again to clear (same toggle idea as fms_legs)."""
-        self._ensure_plans_fresh_for_read()
+        """Tap a row to select that plan. Tapping the same row again keeps it selected."""
         pi = self.browser_list_window_start + (row - 1)
         if not self.plans or pi < 0 or pi >= len(self.plans):
             return
-        if self.index == pi:
-            self.index = -1
-            self._log("list_select_row", row, "-> unselect")
-        else:
-            self.index = pi
-            self._log("list_select_row", row, "-> plan index", pi)
+        self.index = pi
+        self._log("list_select_row", row, "-> plan index", pi)
         self._invalidate_list_cache()
         self._set_status("READY")
         self._publish_state()
@@ -1173,87 +1186,22 @@ class PythonInterface:
         system_path = xp.getSystemPath()
         return os.path.join(system_path, "Output", "FMS plans")
 
-    def _current_fms_snapshot_tuple(self, plans_dir: str) -> tuple:
-        """Stable snapshot of .fms files under plans_dir.
-
-        Includes file metadata so in-place edits are detected, not just renames.
-        """
-        rows = []
-        try:
-            with os.scandir(plans_dir) as it:
-                for entry in it:
-                    if not entry.name.lower().endswith(".fms") or not entry.is_file(follow_symlinks=False):
-                        continue
-                    try:
-                        st = entry.stat(follow_symlinks=False)
-                        rows.append((entry.name, st.st_mtime_ns, st.st_size))
-                    except OSError:
-                        continue
-        except OSError:
-            raise
-        return tuple(sorted(rows))
-
-    def _ensure_plans_fresh_for_read(self, force: bool = False) -> None:
-        """If plans folder appeared/disappeared or *.fms set changed, rescan and republish.
-
-        Debounced on dataref reads (UDP/UI may poll often); use force=True for
-        prev/next/load so user actions always see an up-to-date file list.
-        """
-        plans_dir = self._plans_dir()
-        exists = os.path.isdir(plans_dir)
-
-        if not force:
-            now = time.monotonic()
-            if now - self._last_plan_dir_check_monotonic < self.PLAN_DIR_POLL_MIN_INTERVAL_SEC:
-                self._perf_ensure_debounce_skips += 1
-                if now - self._perf_ensure_last_log_at >= 1.0:
-                    self._perf_log(
-                        f"ensure_debounce_skips_per_sec={self._perf_ensure_debounce_skips}",
-                        f"poll_interval_s={self.PLAN_DIR_POLL_MIN_INTERVAL_SEC:.2f}",
-                    )
-                    self._perf_ensure_debounce_skips = 0
-                    self._perf_ensure_last_log_at = now
-                return
-            self._last_plan_dir_check_monotonic = now
-
-        if self._last_plans_dir_exists is None:
-            self._perf_log("ensure_refresh_trigger=initial_probe")
-            self._refresh_plan_list()
-            return
-        if exists != self._last_plans_dir_exists:
-            self._perf_log(f"ensure_refresh_trigger=dir_exists_change old={self._last_plans_dir_exists} new={exists}")
-            self._refresh_plan_list()
-            return
-        if not exists:
-            return
-
-        try:
-            snapshot = self._current_fms_snapshot_tuple(plans_dir)
-        except OSError as exc:
-            self._log("ensure_plans_fresh: listdir failed", plans_dir, exc)
-            self._perf_log("ensure_snapshot_error", str(exc))
-            return
-
-        if snapshot != self._fms_names_snapshot:
-            self._perf_log(
-                "ensure_refresh_trigger=snapshot_changed",
-                f"old_count={len(self._fms_names_snapshot)}",
-                f"new_count={len(snapshot)}",
-            )
-            self._refresh_plan_list()
-
     def _refresh_plan_list(self):
         t_total_0 = time.perf_counter()
         plans_dir = self._plans_dir()
         self._log("Refreshing plans from", plans_dir)
+
+        # Remember the currently selected filename so we can restore it after refresh.
+        selected_filename = (
+            self.plans[self.index].filename
+            if 0 <= self.index < len(self.plans) else None
+        )
 
         self.plans = []
         self.loaded = 0
         self._invalidate_list_cache()
 
         if not os.path.isdir(plans_dir):
-            self._fms_names_snapshot = ()
-            self._last_plans_dir_exists = False
             self.browser_list_window_start = 0
             self.index = -1
             self._set_status("NO DIR", f"Missing folder: {plans_dir}")
@@ -1261,15 +1209,25 @@ class PythonInterface:
             self._publish_state()
             return
 
-        self._last_plans_dir_exists = True
         t_scan_0 = time.perf_counter()
+        # Single scandir pass: collect filenames and build parse-cache key tuples.
         filenames = []
+        snapshot_rows = []
         with os.scandir(plans_dir) as it:
             for entry in it:
-                if entry.name.lower().endswith(".fms") and entry.is_file(follow_symlinks=False):
-                    filenames.append(entry.name)
-        filenames.sort()
-        self._fms_names_snapshot = self._current_fms_snapshot_tuple(plans_dir)
+                if not entry.name.lower().endswith(".fms") or not entry.is_file(follow_symlinks=False):
+                    continue
+                filenames.append(entry.name)
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    snapshot_rows.append((entry.name, st.st_mtime_ns, st.st_size))
+                except OSError:
+                    pass
+        # Purge cache entries for files that are no longer present or have changed.
+        current_keys = {row for row in snapshot_rows}
+        self._entry_parse_cache = {
+            k: v for k, v in self._entry_parse_cache.items() if k in current_keys
+        }
         t_scan_ms = (time.perf_counter() - t_scan_0) * 1000.0
 
         t_parse_0 = time.perf_counter()
@@ -1281,7 +1239,9 @@ class PythonInterface:
         t_parse_ms = (time.perf_counter() - t_parse_0) * 1000.0
 
         t_sort_0 = time.perf_counter()
-        self._sort_plans()
+        # Always show the most recent PLAN_LIST_MAX_PLANS plans, newest first.
+        self.plans.sort(key=lambda p: (-p.file_timestamp, p.filename.lower()))
+        self.plans = self.plans[:self.PLAN_LIST_MAX_PLANS]
         t_sort_ms = (time.perf_counter() - t_sort_0) * 1000.0
 
         if not self.plans:
@@ -1289,10 +1249,20 @@ class PythonInterface:
             self.browser_list_window_start = 0
             self._set_status("EMPTY")
         else:
-            if self.index >= len(self.plans):
+            # Restore selection by filename so a background rescan doesn't silently
+            # lose the highlight or point self.index at the wrong plan after a re-sort.
+            if selected_filename is not None:
+                self.index = next(
+                    (i for i, p in enumerate(self.plans) if p.filename == selected_filename), -1
+                )
+            elif self.index >= len(self.plans):
                 self.index = -1
-            self.browser_list_window_start = self._plan_list_align_window_start(
-                self.browser_list_window_start, len(self.plans))
+            # Keep selected plan visible in the window.
+            if self.index >= 0:
+                self._plan_list_ensure_index_visible()
+            else:
+                self.browser_list_window_start = self._plan_list_align_window_start(
+                    self.browser_list_window_start, len(self.plans))
             self._set_status("READY")
         self._invalidate_list_cache()
         t_publish_0 = time.perf_counter()
@@ -1359,7 +1329,24 @@ class PythonInterface:
             elif line.startswith("STAR "):
                 star = line.split(" ", 1)[1].strip()
 
-        entries = self._parse_fms_entries(path)
+        # Use entry cache keyed by (filename, mtime_ns, size) to avoid re-parsing
+        # unchanged files on every directory rescan. Reuses the stat() already done above.
+        try:
+            cache_key = (
+                filename,
+                getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)),
+                stat.st_size,
+            )
+        except (OSError, NameError):
+            cache_key = None
+
+        if cache_key is not None and cache_key in self._entry_parse_cache:
+            entries = self._entry_parse_cache[cache_key]
+        else:
+            entries = self._parse_fms_entries(path)
+            if cache_key is not None:
+                self._entry_parse_cache[cache_key] = entries
+
         waypoint_count = len(entries)
         idents = [e.ident for e in entries]
         max_altitude = max((e.altitude for e in entries), default=0)
@@ -1451,7 +1438,6 @@ class PythonInterface:
 
     def _cmd_previous(self):
         """E1 CCW: select previous plan within current visible page only."""
-        self._ensure_plans_fresh_for_read()
         if not self.plans:
             self._set_status("EMPTY")
             self._invalidate_list_cache()
@@ -1467,11 +1453,10 @@ class PythonInterface:
             return
 
         if self.index < start or self.index >= end:
-            self.index = start
+            # Nothing selected on this page: CCW starts from the last visible row.
+            self.index = end - 1
         else:
-            self.index -= 1
-            if self.index < start:
-                self.index = start
+            self.index = max(start, self.index - 1)
 
         self._set_status("READY")
         self._invalidate_list_cache()
@@ -1479,7 +1464,6 @@ class PythonInterface:
 
     def _cmd_next(self):
         """E1 CW: select next plan within current visible page only."""
-        self._ensure_plans_fresh_for_read()
         if not self.plans:
             self._set_status("EMPTY")
             self._invalidate_list_cache()
@@ -1495,11 +1479,10 @@ class PythonInterface:
             return
 
         if self.index < start or self.index >= end:
+            # Nothing selected on this page: CW starts from the first visible row.
             self.index = start
         else:
-            self.index += 1
-            if self.index >= end:
-                self.index = end - 1
+            self.index = min(end - 1, self.index + 1)
 
         self._set_status("READY")
         self._invalidate_list_cache()
@@ -1509,7 +1492,6 @@ class PythonInterface:
         self._refresh_plan_list()
 
     def _cmd_load(self):
-        self._ensure_plans_fresh_for_read(force=True)
         plan = self._selected_plan()
         if plan is None:
             self.loaded = 0
@@ -1591,6 +1573,7 @@ class PythonInterface:
         self._create_command("scroll_down", "Scroll LEGS selection down", self._cmd_legs_scroll_down, prefix=p)
         self._create_command("previous", "Select previous visible LEGS row", self._cmd_legs_previous, prefix=p)
         self._create_command("next", "Select next visible LEGS row", self._cmd_legs_next, prefix=p)
+        self._create_command("activate", "Activate selected LEGS waypoint", self._cmd_legs_activate, prefix=p)
         self._create_command("direct_to", "Direct-to selected LEGS waypoint", self._cmd_legs_direct_to, prefix=p)
         self._create_command("select_row_1", "Select waypoint in row 1", self._cmd_legs_select_row_1, prefix=p)
         self._create_command("select_row_2", "Select waypoint in row 2", self._cmd_legs_select_row_2, prefix=p)
@@ -1723,6 +1706,7 @@ class PythonInterface:
         return str(info.altitude)
 
     def _legs_read_row_is_active(self, row: int) -> int:
+        # Bypass cache: always read live from X-Plane so the active leg is never stale.
         idx = self._legs_fms_index_for_row(row)
         if idx < 0:
             return 0
@@ -1732,6 +1716,8 @@ class PythonInterface:
             return 0
 
     def _legs_read_row_is_selected(self, row: int) -> int:
+        # Bypass cache: computed directly so every poll reflects the current selection
+        # without a race between per-row drefs being polled at different instants.
         idx = self._legs_fms_index_for_row(row)
         if idx < 0:
             return 0
@@ -1818,13 +1804,31 @@ class PythonInterface:
         else:
             self.legs_selected = min(end - 1, self.legs_selected + 1)
 
-    def _cmd_legs_direct_to(self):
+    def _cmd_legs_activate(self):
         try:
             count = xp.countFMSEntries()
             if count <= 0 or self.legs_selected < 0:
                 return
             target = max(0, min(self.legs_selected, count - 1))
             xp.setDestinationFMSEntry(target)
+            info = self._safe_fms_entry_info(target)
+            ident = info.navAidID if info else "?"
+            self._log("legs_activate:", target, ident)
+        except Exception as exc:
+            self._log("legs_activate error:", exc)
+
+    def _cmd_legs_direct_to(self):
+        try:
+            count = xp.countFMSEntries()
+            if count <= 0 or self.legs_selected < 0:
+                return
+            target = max(0, min(self.legs_selected, count - 1))
+            fp = getattr(xp, "FMSFlightPlan_Active", getattr(xp, "ActiveFlightPlan", 0))
+            if hasattr(xp, "setDirectToFMSFlightPlanEntry"):
+                xp.setDirectToFMSFlightPlanEntry(fp, target)
+            else:
+                self._log("legs_direct_to: API xp.setDirectToFMSFlightPlanEntry not available (XP12 feature)")
+                return
             info = self._safe_fms_entry_info(target)
             ident = info.navAidID if info else "?"
             self._log("legs_direct_to:", target, ident)
