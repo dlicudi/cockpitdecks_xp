@@ -704,8 +704,8 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
         self._beacon = XPlaneBeacon()
         self._beacon.set_callback(self.beacon_callback)
         self.dynamic_timeout = RECONNECT_TIMEOUT
-        self.xp_home = environ.get(ENVIRON_KW.SIMULATOR_HOME.value)
         raw_host = environ.get(ENVIRON_KW.API_HOST.value, API_HOST)
+        self._explicit_host = environ.get(ENVIRON_KW.API_HOST.value) is not None
         self.api_port = environ.get(ENVIRON_KW.API_PORT.value, API_TPC_PORT)
         self.api_path = environ.get(ENVIRON_KW.API_PATH.value, API_PATH)
         self.api_version = environ.get(ENVIRON_KW.API_VERSION.value, DEFAULT_WEB_API_VERSION_STR)
@@ -1476,8 +1476,9 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
         logger.warning("<*> " * 30)
         logger.warning(f"no answer from {who}, investigating..")
 
-        # Do we have a beacon?
-        self.wait_for_beacon()
+        # Do we have a beacon? (skipped when explicit API_HOST is configured)
+        if not self._explicit_host:
+            self.wait_for_beacon()
         self.xplane_status = XPLANE_STATUS.BEACON_DETECTED
 
         # Is the REST API reachable?
@@ -1563,7 +1564,10 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
         Starts connect loop.
         """
         self._terminating = False
-        self._beacon.start_monitor()
+        if not self._explicit_host:
+            self._beacon.start_monitor()
+        else:
+            startup_logger.debug("explicit API_HOST set, skipping beacon monitor")
         super().connect(reload_cache)
 
     def disconnect(self):
