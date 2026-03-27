@@ -1542,8 +1542,8 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
             if isinstance(aircraft_path, (bytes, bytearray)):
                 aircraft_path = aircraft_path.decode()
             if aircraft_path:
-                logger.info(f"aircraft already loaded at startup, triggering change_aircraft({aircraft_path!r})")
-                self.cockpit.change_aircraft(newpath=aircraft_path)
+                logger.info(f"aircraft already loaded at startup, ignoring automatic aircraft change for {aircraft_path!r}")
+                self.cockpit.reload_pages()  # request page variables and take into account updated values
             else:
                 logger.info("request to reload pages")
                 self.cockpit.reload_pages()  # to request page variables and take into account updated values
@@ -1567,7 +1567,7 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
         if not self._explicit_host:
             self._beacon.start_monitor()
         else:
-            startup_logger.debug("explicit API_HOST set, skipping beacon monitor")
+            logger.debug("explicit API_HOST set, skipping beacon monitor")
         super().connect(reload_cache)
 
     def disconnect(self):
