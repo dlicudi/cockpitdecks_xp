@@ -1564,6 +1564,8 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
         Starts connect loop.
         """
         self._terminating = False
+        logger.info(f"X-Plane API target host={self.api_host} port={self.api_port} path={self.api_path} version={self.api_version}")
+        logger.info(f"X-Plane websocket target {self.ws_url}")
         if not self._explicit_host:
             self._beacon.start_monitor()
         else:
