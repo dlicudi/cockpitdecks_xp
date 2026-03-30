@@ -139,12 +139,24 @@ class Dataref(SimulatorVariable, DatarefAPI):
 
     @property
     def value(self):
-        # Preserve text/dataref decoding for DATA bytes payloads.
-        self._encoding = "ascii" if self._encoding is None else self._encoding
-        # https://stackoverflow.com/questions/1021464/how-to-call-a-property-of-the-base-class-if-this-property-is-being-overwritten-i
-        if type(DatarefAPI.value.fget(self)) is bytes and self.value_type == DATAREF_DATATYPE.DATA.value:
-            return self.get_string_value(self._encoding)
-        return super().value
+        # Prevent synchronous REST calls during the rendering loop.
+        # We strictly return the current cached value (updated asynchronously by UDP/Websocket).
+        # Calling DatarefAPI.value.fget(self) or self.get_string_value() would trigger a blocking REST fetch.
+        if self.name not in self.simulator.simulator_variable_to_monitor:
+            if not hasattr(self, "_unmonitored_warned"):
+                logger.warning(f"dataref {self.name} is NOT monitored; returning cached/default value to avoid synchronous network lag during render.")
+                self._unmonitored_warned = True
+            return super().value
+
+        val = super().value
+        # Preserve text/dataref decoding for DATA bytes payloads using the LOCAL cache.
+        if isinstance(val, (bytes, bytearray)):
+            self._encoding = "ascii" if self._encoding is None else self._encoding
+            try:
+                return val.decode(self._encoding).strip("\x00")
+            except:
+                return val
+        return val
 
 
 # An events from X-Plane Simulator
