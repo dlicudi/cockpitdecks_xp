@@ -890,7 +890,10 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
         if not self.connected:
             return
         if len(self._dataref_by_id) > 0:
-            self.register_bulk_dataref_value_event(datarefs=self._dataref_by_id, on=False)
+            # After reload_caches(), previously subscribed numeric ids may no longer exist.
+            # Do not send unsubscribe requests for stale ids; just drop the local mapping
+            # and re-subscribe using freshly resolved ids below.
+            logger.debug(f"dropping {len(self._dataref_by_id)} stale websocket dataref subscription group(s) after cache reload")
         self._dataref_by_id = {}
         self._requested_indices_by_id = {}
         datarefs = {}
@@ -1120,7 +1123,7 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
                         del self._dataref_by_id[i]
                         to_unsubscribe[i] = d
                 else:
-                    logger.warning(f"no dataref for id={self.all_datarefs.equiv(ident=i)}")
+                    logger.debug(f"no dataref for id={self.all_datarefs.equiv(ident=i)}")
             
             if len(to_unsubscribe) > 0:
                 self.register_bulk_dataref_value_event(datarefs=to_unsubscribe, on=False)
