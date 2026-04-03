@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Symlink (or copy) PI_CockpitdecksFMSBrowser.py from this repo into X-Plane's PythonPlugins.
+# Symlink (or copy) PI_CockpitdecksFMS.py from this repo into X-Plane's PythonPlugins.
 # Usage: ./scripts/link_fms_plugin.sh [XPLANE_ROOT]
 #   or:  XPLANE_ROOT=/path/to/X-Plane\ 12 ./scripts/link_fms_plugin.sh
 #   or:  ./scripts/link_fms_plugin.sh --copy /path/to/X-Plane\ 12  (use copy instead of symlink)
@@ -13,10 +13,10 @@ USE_COPY=false
 [[ "$1" == "--copy" ]] && { USE_COPY=true; shift; }
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PLUGIN_SRC="${REPO_ROOT}/cockpitdecks_xp/resources/xppython3-plugins/PI_CockpitdecksFMSBrowser.py"
+PLUGIN_SRC="${REPO_ROOT}/cockpitdecks_xp/resources/xppython3-plugins/PI_CockpitdecksFMS.py"
 XPLANE_ROOT="${XPLANE_ROOT:-$1}"
 PLUGINS_DIR="${XPLANE_ROOT}/Resources/plugins/PythonPlugins"
-PLUGIN_DST="${PLUGINS_DIR}/PI_CockpitdecksFMSBrowser.py"
+PLUGIN_DST="${PLUGINS_DIR}/PI_CockpitdecksFMS.py"
 
 if [[ -z "$XPLANE_ROOT" ]]; then
   echo "Usage: $0 <XPLANE_ROOT>"

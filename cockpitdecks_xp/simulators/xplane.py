@@ -144,7 +144,10 @@ class Dataref(SimulatorVariable, DatarefAPI):
         # Calling DatarefAPI.value.fget(self) or self.get_string_value() would trigger a blocking REST fetch.
         if self.name not in self.simulator.simulator_variable_to_monitor:
             if not hasattr(self, "_unmonitored_warned"):
-                logger.warning(f"dataref {self.name} is NOT monitored; returning cached/default value to avoid synchronous network lag during render.")
+                startup_thread = threading.current_thread().name.startswith("XPlane::Startup")
+                startup_or_disconnected = self.simulator.ws is None or self.simulator.waiting_for_resource or startup_thread
+                log = logger.debug if startup_or_disconnected else logger.warning
+                log(f"dataref {self.name} is NOT monitored; returning cached/default value to avoid synchronous network lag during render.")
                 self._unmonitored_warned = True
             return super().value
 
@@ -1569,7 +1572,12 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
 
     def _on_ws_close(self):
         if not self._terminating:
-            self.lost_connection(who="websocket closed")
+            threading.Thread(
+                target=self.lost_connection,
+                kwargs={"who": "websocket closed"},
+                name="XPlane::LostConnection",
+                daemon=True,
+            ).start()
 
     def connect(self, reload_cache: bool = False):
         """

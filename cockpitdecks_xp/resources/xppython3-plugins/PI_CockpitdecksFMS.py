@@ -37,23 +37,48 @@ class FlightPlanEntry:
     lon: float
 
 
+@dataclass
+class ProcedureInfo:
+    name: str            # raw procedure identifier, e.g. "CHATY5", "I06L"
+    proc_type: str       # "SID" | "STAR" | "APP"
+    transition: str      # runway for SID (e.g. "06B"), entry fix for STAR, blank for APP common
+    waypoints: List[str] # ordered fix idents (vector legs excluded)
+    display_name: str    # human-readable, e.g. "CHATY5 06B", "ILS 06L"
+    display_runway: str  # runway portion for the second column, e.g. "06B", "24R"
+
+
 class PythonInterface:
-    NAME = "Cockpitdecks FMS Browser"
-    SIG = "xppython3.cockpitdecksfmsbrowser"
+    NAME = "Cockpitdecks FMS"
+    SIG = "xppython3.cockpitdecksfms"
     DESC = (
-        "Browse Output/FMS plans and load selected plan into default FMS. "
-        "LOAD page (fms_load): list_row_1..3 + list_scroll_up/down move by page (plans 1–3, 4–6, …), "
-        "same 3-row paging as fms_legs on fms_fpl. "
-        "Encoder commands order (Cockpitdecks): [0]=CCW→list_scroll_up, [1]=CW→list_scroll_down — same as fms_fpl E0."
+        "Cockpitdecks FMS plugin: browse and load Output/FMS plans (cockpitdecks/fms/load), "
+        "scrollable LEGS list with waypoint selection/activation/direct-to (cockpitdecks/fms/legs), "
+        "live FMS state datarefs, and map range control."
     )
-    RELEASE = "2.0.20"
+    RELEASE = "2.0.22"
 
-    DREF_PREFIX = "cockpitdecks/fms_browser"
-    CMD_PREFIX = "cockpitdecks/fms_browser"
+    DREF_PREFIX = "cockpitdecks/fms/load"
+    CMD_PREFIX = "cockpitdecks/fms/load"
 
-    LEGS_DREF_PREFIX = "cockpitdecks/fms_legs"
-    LEGS_CMD_PREFIX = "cockpitdecks/fms_legs"
+    LEGS_DREF_PREFIX = "cockpitdecks/fms/legs"
+    LEGS_CMD_PREFIX = "cockpitdecks/fms/legs"
     LEGS_VISIBLE_ROWS = 3
+
+    DEP_DREF_PREFIX = "cockpitdecks/fms/dep"
+    DEP_CMD_PREFIX = "cockpitdecks/fms/dep"
+    ARR_DREF_PREFIX = "cockpitdecks/fms/arr"
+    ARR_CMD_PREFIX = "cockpitdecks/fms/arr"
+    APP_DREF_PREFIX = "cockpitdecks/fms/app"
+    APP_CMD_PREFIX = "cockpitdecks/fms/app"
+    PROC_VISIBLE_ROWS = 3
+    KINDS = ("dep", "arr", "app")
+    _KIND_CIFP_TYPE = {"dep": "SID", "arr": "STAR", "app": "APP"}
+
+    _APP_TYPE_LABELS = {
+        "I": "ILS", "R": "RNAV", "V": "VOR", "N": "NDB", "L": "LOC",
+        "D": "DME", "S": "RNAV", "B": "LOC BC", "T": "TACAN",
+        "U": "SDF", "H": "HUD", "P": "GPS", "Q": "RNAV", "X": "LDA",
+    }
 
     # Plan file browser: 3 visible rows (Loupedeck Live 4×3), same paging idea as fms_legs
     PLAN_LIST_VISIBLE_ROWS = 3
@@ -115,6 +140,21 @@ class PythonInterface:
         self.accessors = []
         self.commands: Dict[str, Dict[str, object]] = {}
 
+        # Procedure state (dep=SID, arr=STAR, app=APP — each section independent)
+        self.proc_dep_icao = ""
+        self.proc_dest_icao = ""
+        self._cifp_cache: Dict[str, List[ProcedureInfo]] = {}
+        self._proc_procs: Dict[str, List[ProcedureInfo]] = {k: [] for k in self.KINDS}
+        self._proc_index: Dict[str, int] = {k: -1 for k in self.KINDS}
+        self._proc_window: Dict[str, int] = {k: 0 for k in self.KINDS}
+        self._proc_cache_valid: Dict[str, bool] = {k: False for k in self.KINDS}
+        self._proc_rows_cache: Dict[str, Dict[int, Dict[str, object]]] = {k: {} for k in self.KINDS}
+        self._proc_status: Dict[str, str] = {k: "INIT" for k in self.KINDS}
+        # FMS splice point: index at which arr/app was last inserted (for replace-not-append)
+        self._proc_splice_point: Dict[str, int] = {k: -1 for k in self.KINDS}
+        # Display name of the last successfully activated procedure per kind
+        self._proc_loaded: Dict[str, str] = {k: "" for k in self.KINDS}
+
         self.string_values: Dict[str, str] = {
             "plan_name": "No flight plans",
             "plan_departure": "----",
@@ -127,8 +167,10 @@ class PythonInterface:
             "plan_sid": "",
             "plan_star": "",
             "plan_waypoints": "",
+            "loaded_filename": "",
             "loaded_sid": "",
             "loaded_star": "",
+            "map_mode": "",
             "status": "INIT",
             "last_error": "",
         }
@@ -136,6 +178,7 @@ class PythonInterface:
             "index": 0,
             "count": 0,
             "loaded": 0,
+            "loaded_index": 0,
             "action": 0,
             "last_action": 0,
             "action_ack": 0,
@@ -148,9 +191,6 @@ class PythonInterface:
         }
 
         self._perf_enabled = True
-        self._perf_row_reads = 0
-        self._perf_row_read_time_ms = 0.0
-        self._perf_row_read_log_at = time.monotonic()
         self._list_rows_cache: Dict[int, Dict[str, object]] = {}
         self._list_cache_valid = False
         # Cache for parsed FMS entries, keyed by (filename, mtime_ns, size).
@@ -233,6 +273,10 @@ class PythonInterface:
         self._register_legs_drefs()
         self._create_legs_commands()
 
+        self._proc_register_section("dep", self.DEP_DREF_PREFIX, self.DEP_CMD_PREFIX)
+        self._proc_register_section("arr", self.ARR_DREF_PREFIX, self.ARR_CMD_PREFIX)
+        self._proc_register_section("app", self.APP_DREF_PREFIX, self.APP_CMD_PREFIX)
+
         self._refresh_plan_list()
         return self.NAME, self.SIG, self.DESC
 
@@ -258,6 +302,7 @@ class PythonInterface:
     def XPluginEnable(self):
         self.enabled = True
         self._log("XPluginEnable")
+        self._proc_airports_from_fms()
         return 1
 
     def XPluginDisable(self):
@@ -371,7 +416,7 @@ class PythonInterface:
 
         xp.registerCommandHandler(cmd_ref, handler, 1, None)
         self._log("registerCommandHandler", name, "-> OK")
-        self.commands[suffix] = {"ref": cmd_ref, "fun": handler}
+        self.commands[name] = {"ref": cmd_ref, "fun": handler}
 
     def _set_status(self, text: str, error: str = ""):
         self.last_status = text
@@ -752,35 +797,6 @@ class PythonInterface:
         aligned = (max(0, int(w)) // self.PLAN_LIST_VISIBLE_ROWS) * self.PLAN_LIST_VISIBLE_ROWS
         return max(0, min(aligned, max_w))
 
-    def _plan_list_plan_index_for_row(self, row: int) -> int:
-        """0-based index into self.plans for visible row (1..3), or -1 if empty slot.
-
-        Hot path: row drefs are polled frequently on fms_load. Plans are loaded once
-        on startup/plane-load or on explicit REFRESH — no filesystem checks here.
-        """
-        t0 = time.perf_counter()
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        self._perf_row_reads += 1
-        self._perf_row_read_time_ms += dt_ms
-        now = time.monotonic()
-        if now - self._perf_row_read_log_at >= 1.0:
-            avg_ms = self._perf_row_read_time_ms / max(self._perf_row_reads, 1)
-            self._perf_log(
-                f"row_reads_per_sec={self._perf_row_reads}",
-                f"row_read_avg_ms={avg_ms:.3f}",
-                f"row_read_total_ms={self._perf_row_read_time_ms:.2f}",
-                f"plans={len(self.plans)}",
-            )
-            self._perf_row_reads = 0
-            self._perf_row_read_time_ms = 0.0
-            self._perf_row_read_log_at = now
-        if not self.plans:
-            return -1
-        idx = self.browser_list_window_start + (row - 1)
-        if idx < 0 or idx >= len(self.plans):
-            return -1
-        return idx
-
     def _invalidate_list_cache(self) -> None:
         self._list_cache_valid = False
 
@@ -891,11 +907,6 @@ class PythonInterface:
         self._ensure_list_cache()
         return int(self._list_rows_cache.get(row, {}).get("max_alt_ft", 0))
 
-    def _plan_list_read_selected_row_logged(self) -> int:
-        val = self._plan_list_read_selected_row()
-        xp.log(f"FMS BROWSER TRACE: list_selected_row = {val}")
-        return val
-
     def _plan_list_read_selected_row(self) -> int:
         w = self.browser_list_window_start
         n = len(self.plans)
@@ -957,7 +968,6 @@ class PythonInterface:
         self._register_live_string_dref("list_sel_count", self._plan_list_read_selected_over_count, prefix=p)
         self._register_live_string_dref("list_sort_key", self._plan_list_read_sort_key_label, prefix=p)
         self._register_live_string_dref("list_sort_direction", self._plan_list_read_sort_dir_label, prefix=p)
-        self._register_live_string_dref("list_sort_mode", self._plan_list_read_sort_key_label, prefix=p)
         self._register_live_int_dref("list_window_page", self._plan_list_read_window_page, prefix=p)
         for row in range(1, self.PLAN_LIST_VISIBLE_ROWS + 1):
             self._register_live_string_dref(
@@ -1224,7 +1234,7 @@ class PythonInterface:
                 except OSError:
                     pass
         # Purge cache entries for files that are no longer present or have changed.
-        current_keys = {row for row in snapshot_rows}
+        current_keys = set(snapshot_rows)
         self._entry_parse_cache = {
             k: v for k, v in self._entry_parse_cache.items() if k in current_keys
         }
@@ -1491,6 +1501,24 @@ class PythonInterface:
     def _cmd_refresh(self):
         self._refresh_plan_list()
 
+    def _get_cached_entries(self, plan: FlightPlanInfo) -> List[FlightPlanEntry]:
+        """Return parsed FMS entries for plan, using the entry cache when possible."""
+        try:
+            stat = os.stat(plan.full_path)
+            cache_key = (
+                plan.filename,
+                getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)),
+                stat.st_size,
+            )
+        except OSError:
+            cache_key = None
+        if cache_key is not None and cache_key in self._entry_parse_cache:
+            return self._entry_parse_cache[cache_key]
+        entries = self._parse_fms_entries(plan.full_path)
+        if cache_key is not None:
+            self._entry_parse_cache[cache_key] = entries
+        return entries
+
     def _cmd_load(self):
         plan = self._selected_plan()
         if plan is None:
@@ -1503,7 +1531,7 @@ class PythonInterface:
             return
 
         try:
-            entries = self._parse_fms_entries(plan.full_path)
+            entries = self._get_cached_entries(plan)
             if not entries:
                 self.loaded = 0
                 self._set_status("LOAD FAIL", "No loadable FMS entries found")
@@ -1525,6 +1553,13 @@ class PythonInterface:
             self.loaded_distance_nm = plan.total_distance_nm
             self._set_status("LOADED")
             self._legs_init_after_load()
+            # Refresh procedure lists for the new departure/destination airports
+            new_dep = (plan.dep or "").strip().upper()
+            new_dest = (plan.dest or "").strip().upper()
+            if new_dep != self.proc_dep_icao or new_dest != self.proc_dest_icao:
+                self.proc_dep_icao = new_dep
+                self.proc_dest_icao = new_dest
+                self._proc_refresh()
         except Exception as exc:
             self.loaded = 0
             self._set_status("LOAD ERR", str(exc))
@@ -1579,6 +1614,9 @@ class PythonInterface:
         self._create_command("select_row_2", "Select waypoint in row 2", self._cmd_legs_select_row_2, prefix=p)
         self._create_command("select_row_3", "Select waypoint in row 3", self._cmd_legs_select_row_3, prefix=p)
         self._create_command("clear_selected", "Clear selected LEGS waypoint", self._cmd_legs_clear_selected, prefix=p)
+        self._create_command("clear_from_here", "Clear from selected waypoint to end", self._cmd_legs_clear_from_here, prefix=p)
+        self._create_command("clear_all", "Clear entire FMS route", self._cmd_legs_clear_all, prefix=p)
+        self._create_command("direct_to_destination", "Direct-to destination (last FMS entry)", self._cmd_legs_direct_to_destination, prefix=p)
 
     # ── LEGS state helpers ──
 
@@ -1868,9 +1906,6 @@ class PythonInterface:
             info = self._safe_fms_entry_info(target)
             ident = info.navAidID if info else "?"
             xp.clearFMSEntry(target)
-            # Indices shifted: entries after target moved down
-            if self.legs_selected > target:
-                self.legs_selected -= 1
             new_count = count - 1
             if new_count <= 0:
                 self.legs_selected = -1
@@ -1884,3 +1919,567 @@ class PythonInterface:
             self._log("legs_clear_selected: cleared", target, ident)
         except Exception as exc:
             self._log("legs_clear_selected error:", exc)
+
+    def _cmd_legs_clear_from_here(self):
+        """Clear from selected waypoint to end of route."""
+        try:
+            count = xp.countFMSEntries()
+            if count <= 0 or self.legs_selected < 0:
+                return
+            target = max(0, min(self.legs_selected, count - 1))
+            for i in range(count - 1, target - 1, -1):
+                xp.clearFMSEntry(i)
+            new_count = target
+            if new_count <= 0:
+                self.legs_selected = -1
+                self.legs_window_start = 0
+            else:
+                self.legs_selected = min(self.legs_selected, new_count - 1)
+                max_start = max(0, new_count - 1)
+                self.legs_window_start = max(0, min(self.legs_window_start, max_start))
+            self._log("legs_clear_from_here: cleared from", target, "count was", count)
+        except Exception as exc:
+            self._log("legs_clear_from_here error:", exc)
+
+    def _cmd_legs_clear_all(self):
+        """Clear entire FMS route."""
+        try:
+            self._clear_fms()
+            self.legs_selected = -1
+            self.legs_window_start = 0
+            self._log("legs_clear_all")
+        except Exception as exc:
+            self._log("legs_clear_all error:", exc)
+
+    def _cmd_legs_direct_to_destination(self):
+        """Direct-to the last FMS entry (destination)."""
+        try:
+            count = xp.countFMSEntries()
+            if count <= 0:
+                return
+            dest_idx = count - 1
+            fp = getattr(xp, "FMSFlightPlan_Active", getattr(xp, "ActiveFlightPlan", 0))
+            if hasattr(xp, "setDirectToFMSFlightPlanEntry"):
+                xp.setDirectToFMSFlightPlanEntry(fp, dest_idx)
+            else:
+                xp.setDestinationFMSEntry(dest_idx)
+            info = self._safe_fms_entry_info(dest_idx)
+            ident = info.navAidID if info else "?"
+            self._log("direct_to_destination:", dest_idx, ident)
+        except Exception as exc:
+            self._log("direct_to_destination error:", exc)
+
+    # ── Procedures (DEP / ARR / APP) ───────────────────────────
+
+    def _cifp_path(self, icao: str) -> Optional[str]:
+        """Return path to CIFP file for airport, preferring Custom Data over default data."""
+        system_path = xp.getSystemPath()
+        for subdir in ("Custom Data", os.path.join("Resources", "default data")):
+            path = os.path.join(system_path, subdir, "CIFP", f"{icao.upper()}.dat")
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def _parse_cifp(self, icao: str) -> List[ProcedureInfo]:
+        """Parse CIFP file for airport and return ProcedureInfo list (all modes)."""
+        if icao in self._cifp_cache:
+            return self._cifp_cache[icao]
+
+        path = self._cifp_path(icao)
+        if not path:
+            self._log("No CIFP file for", icao)
+            self._cifp_cache[icao] = []
+            return []
+
+        # Collect raw legs: {(proc_type, proc_name, transition): [(seq, fix_ident), ...]}
+        raw: Dict[tuple, list] = {}
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or ":" not in line:
+                        continue
+                    rec_type, _, rest = line.partition(":")
+                    rec_type = rec_type.strip()
+                    if rec_type not in ("SID", "STAR", "APPCH"):
+                        continue
+                    rest = rest.rstrip(";")
+                    fields = [fld.strip() for fld in rest.split(",")]
+                    if len(fields) < 5:
+                        continue
+                    try:
+                        seq = int(fields[0])
+                    except (ValueError, TypeError):
+                        seq = 0
+                    proc_name = fields[2]
+                    transition = fields[3]
+                    fix_ident = fields[4]
+                    if not proc_name or not fix_ident:
+                        continue
+                    pt = "APP" if rec_type == "APPCH" else rec_type
+                    key = (pt, proc_name, transition)
+                    raw.setdefault(key, []).append((seq, fix_ident))
+        except Exception as exc:
+            self._log("CIFP parse error", icao, exc)
+            self._cifp_cache[icao] = []
+            return []
+
+        procedures: List[ProcedureInfo] = []
+
+        for (pt, proc_name, transition), legs in sorted(raw.items()):
+            # SID: only create entries for runway transitions (transition starts with "RW")
+            # STAR: only create entries for named enroute transitions (non-blank transition)
+            # APP: create one entry per (proc_name, transition) combination
+            if pt == "SID" and not transition.startswith("RW"):
+                continue
+            if pt == "STAR" and not transition:
+                continue
+
+            # Waypoints: transition-specific legs (sorted by seq)
+            t_legs = sorted(legs, key=lambda x: x[0])
+            wpts = list(dict.fromkeys(fix for _, fix in t_legs if fix))
+
+            # Merge in common-route legs (blank transition) if present
+            common_key = (pt, proc_name, "")
+            if common_key in raw:
+                c_legs = sorted(raw[common_key], key=lambda x: x[0])
+                c_wpts = list(dict.fromkeys(fix for _, fix in c_legs if fix))
+                if pt == "SID":
+                    # runway transition first, then common route
+                    wpts = wpts + [w for w in c_wpts if w not in wpts]
+                else:
+                    # transition (enroute entry / IAF) leads into common route — transition first
+                    wpts = wpts + [w for w in c_wpts if w not in wpts]
+
+            if not wpts:
+                continue
+
+            if pt == "SID":
+                rwy = transition[2:] if transition.startswith("RW") else transition
+                display_name = f"{proc_name} {rwy}" if rwy else proc_name
+                display_runway = rwy
+            elif pt == "STAR":
+                display_name = f"{proc_name} {transition}" if transition else proc_name
+                display_runway = transition
+            else:  # APP
+                app_type = self._APP_TYPE_LABELS.get(proc_name[0], proc_name[0]) if proc_name else ""
+                rwy = proc_name[1:] if len(proc_name) > 1 else proc_name
+                display_name = f"{app_type} {rwy}".strip()
+                display_runway = rwy
+
+            procedures.append(ProcedureInfo(
+                name=proc_name,
+                proc_type=pt,
+                transition=transition,
+                waypoints=wpts,
+                display_name=display_name,
+                display_runway=display_runway,
+            ))
+
+        # Deduplicate APP entries: one per proc_name, preferring a non-blank transition (IAF)
+        # so the loaded approach includes IAF→FAF→MAP, not just FAF→MAP.
+        # If only a blank (common route) entry exists, fall back to that.
+        raw_app_count = sum(1 for p in procedures if p.proc_type == "APP")
+        self._log("CIFP pre-dedup APP count:", raw_app_count, "for", icao)
+        app_rep: Dict[str, ProcedureInfo] = {}
+        for p in procedures:
+            if p.proc_type != "APP":
+                continue
+            existing = app_rep.get(p.name)
+            if existing is None:
+                app_rep[p.name] = p
+            elif existing.transition == "" and p.transition != "":
+                # Upgrade from common-route-only to a full IAF transition
+                app_rep[p.name] = p
+        deduped: List[ProcedureInfo] = []
+        seen_app: set = set()
+        for p in procedures:
+            if p.proc_type != "APP":
+                deduped.append(p)
+            elif p.name not in seen_app:
+                deduped.append(app_rep[p.name])
+                seen_app.add(p.name)
+        procedures = deduped
+
+        self._cifp_cache[icao] = procedures
+        by_type = {}
+        for p in procedures:
+            by_type[p.proc_type] = by_type.get(p.proc_type, 0) + 1
+        self._log("CIFP parsed", icao, "->", len(procedures), "procedures", by_type)
+        # Debug: log APP entries so we can diagnose missing approaches
+        for p in procedures:
+            if p.proc_type == "APP":
+                self._log("  APP:", p.display_name, "trans=", p.transition, "wpts=", len(p.waypoints))
+        return procedures
+
+    def _proc_airport_for(self, kind: str) -> str:
+        return self.proc_dep_icao if kind == "dep" else self.proc_dest_icao
+
+    def _proc_invalidate_cache(self, kind: str) -> None:
+        self._proc_cache_valid[kind] = False
+
+    def _proc_selected_name(self, kind: str) -> str:
+        idx = self._proc_index.get(kind, -1)
+        procs = self._proc_procs.get(kind, [])
+        return procs[idx].display_name if 0 <= idx < len(procs) else ""
+
+    def _proc_selected_runway(self, kind: str) -> str:
+        idx = self._proc_index.get(kind, -1)
+        procs = self._proc_procs.get(kind, [])
+        return procs[idx].display_runway if 0 <= idx < len(procs) else ""
+
+    def _proc_window_page(self, kind: str) -> int:
+        n = len(self._proc_procs.get(kind, []))
+        if n <= 0:
+            return 1
+        return self._proc_window.get(kind, 0) // self.PROC_VISIBLE_ROWS + 1
+
+    def _proc_list_page_str(self, kind: str) -> str:
+        n = len(self._proc_procs.get(kind, []))
+        if n <= 0:
+            return ""
+        page = self._proc_window.get(kind, 0) // self.PROC_VISIBLE_ROWS + 1
+        total = (n + self.PROC_VISIBLE_ROWS - 1) // self.PROC_VISIBLE_ROWS
+        return f"{page}/{total}"
+
+    def _proc_sel_count_str(self, kind: str) -> str:
+        n = len(self._proc_procs.get(kind, []))
+        if n <= 0:
+            return "0/0"
+        idx = self._proc_index.get(kind, -1)
+        w = self._proc_window.get(kind, 0)
+        if idx >= 0:
+            row_on_page = idx - w + 1
+            if 1 <= row_on_page <= self.PROC_VISIBLE_ROWS:
+                return f"{row_on_page}/{self.PROC_VISIBLE_ROWS}"
+            return f"-/{self.PROC_VISIBLE_ROWS}"
+        return f"-/{self.PROC_VISIBLE_ROWS}"
+
+    def _proc_ensure_cache(self, kind: str) -> None:
+        if self._proc_cache_valid.get(kind, False):
+            return
+        procs = self._proc_procs.get(kind, [])
+        n = len(procs)
+        w = self._proc_window.get(kind, 0)
+        idx = self._proc_index.get(kind, -1)
+        rows: Dict[int, Dict[str, object]] = {}
+        for row in range(1, self.PROC_VISIBLE_ROWS + 1):
+            pi = w + (row - 1)
+            if pi < 0 or pi >= n:
+                rows[row] = {"plan_index": -1, "index": "", "name": "", "runway": "", "is_selected": 0, "status": ""}
+                continue
+            proc = procs[pi]
+            is_sel = int(idx >= 0 and pi == idx)
+            rows[row] = {
+                "plan_index": pi,
+                "index": str(pi + 1),
+                "name": proc.display_name,
+                "runway": proc.display_runway,
+                "is_selected": is_sel,
+                "status": "SEL" if is_sel else "",
+            }
+        self._proc_rows_cache[kind] = rows
+        self._proc_cache_valid[kind] = True
+
+    def _proc_read_row_str(self, kind: str, row: int, field: str) -> str:
+        self._proc_ensure_cache(kind)
+        return str(self._proc_rows_cache.get(kind, {}).get(row, {}).get(field, ""))
+
+    def _proc_read_row_int(self, kind: str, row: int, field: str) -> int:
+        self._proc_ensure_cache(kind)
+        val = self._proc_rows_cache.get(kind, {}).get(row, {}).get(field, 0)
+        return val if isinstance(val, int) else 0
+
+    def _proc_max_aligned_window_start(self, n: int) -> int:
+        if n <= 0:
+            return 0
+        return ((n - 1) // self.PROC_VISIBLE_ROWS) * self.PROC_VISIBLE_ROWS
+
+    def _proc_airports_from_fms(self) -> None:
+        """Populate proc_dep_icao/proc_dest_icao from live FMS airport entries.
+
+        Only updates if airports are not already known — avoids clobbering good values
+        after a SID is loaded (which replaces the departure airport with SID fixes).
+        Valid ICAO codes are exactly 4 characters; longer idents are SID/STAR fixes.
+        """
+        if self.proc_dep_icao and self.proc_dest_icao:
+            return  # already have both airports; don't clobber with FMS fix names
+        try:
+            count = xp.countFMSEntries()
+            if count <= 0:
+                return
+            dep_icao = self.proc_dep_icao
+            dest_icao = self.proc_dest_icao
+            if not dep_icao:
+                for i in range(min(count, 6)):
+                    info = xp.getFMSEntryInfo(i)
+                    if getattr(info, "type", None) == xp.Nav_Airport:
+                        icao = (getattr(info, "navAidID", "") or "").strip().upper()
+                        if len(icao) == 4:
+                            dep_icao = icao
+                            break
+            if not dest_icao:
+                for i in range(count - 1, max(count - 7, -1), -1):
+                    info = xp.getFMSEntryInfo(i)
+                    if getattr(info, "type", None) == xp.Nav_Airport:
+                        icao = (getattr(info, "navAidID", "") or "").strip().upper()
+                        if len(icao) == 4:
+                            dest_icao = icao
+                            break
+            if dep_icao or dest_icao:
+                changed = (dep_icao != self.proc_dep_icao or dest_icao != self.proc_dest_icao)
+                self.proc_dep_icao = dep_icao
+                self.proc_dest_icao = dest_icao
+                self._log("proc_airports_from_fms: dep=", dep_icao, "dest=", dest_icao)
+                if changed:
+                    self._proc_refresh()
+        except Exception as exc:
+            self._log("proc_airports_from_fms error:", exc)
+
+    def _proc_refresh(self) -> None:
+        """Reload procedures from CIFP for dep/dest airports."""
+        dep = self.proc_dep_icao.strip().upper()
+        dest = self.proc_dest_icao.strip().upper()
+
+        dep_procs: List[ProcedureInfo] = self._parse_cifp(dep) if dep else []
+        dest_procs: List[ProcedureInfo] = self._parse_cifp(dest) if dest else []
+
+        self._proc_procs["dep"] = [p for p in dep_procs if p.proc_type == "SID"]
+        self._proc_procs["arr"] = [p for p in dest_procs if p.proc_type == "STAR"]
+        self._proc_procs["app"] = [p for p in dest_procs if p.proc_type == "APP"]
+
+        for k in self.KINDS:
+            self._proc_index[k] = -1
+            self._proc_window[k] = 0
+            self._proc_cache_valid[k] = False
+            self._proc_status[k] = "READY"
+            self._proc_splice_point[k] = -1
+            self._proc_loaded[k] = ""
+
+        self._log("proc_refresh: dep(SID)", len(self._proc_procs["dep"]),
+                  "arr(STAR)", len(self._proc_procs["arr"]),
+                  "app(APP)", len(self._proc_procs["app"]))
+
+    def _proc_register_section(self, kind: str, dref_prefix: str, cmd_prefix: str) -> None:
+        p = dref_prefix
+        c = cmd_prefix
+        self._register_live_string_dref("airport", lambda k=kind: self._proc_airport_for(k), prefix=p)
+        self._register_live_string_dref("status", lambda k=kind: self._proc_status.get(k, ""), prefix=p)
+        self._register_live_string_dref("loaded_name", lambda k=kind: self._proc_loaded.get(k, ""), prefix=p)
+        self._register_live_string_dref("selected_name", lambda k=kind: self._proc_selected_name(k), prefix=p)
+        self._register_live_string_dref("selected_runway", lambda k=kind: self._proc_selected_runway(k), prefix=p)
+        self._register_live_string_dref("list_page", lambda k=kind: self._proc_list_page_str(k), prefix=p)
+        self._register_live_string_dref("list_sel_count", lambda k=kind: self._proc_sel_count_str(k), prefix=p)
+        self._register_live_int_dref("count", lambda k=kind: len(self._proc_procs.get(k, [])), prefix=p)
+        self._register_live_int_dref("index", lambda k=kind: (self._proc_index.get(k, -1) + 1) if self._proc_index.get(k, -1) >= 0 else 0, prefix=p)
+        self._register_live_int_dref("list_window_page", lambda k=kind: self._proc_window_page(k), prefix=p)
+        for row in range(1, self.PROC_VISIBLE_ROWS + 1):
+            self._register_live_string_dref(f"list_row_{row}_name", lambda k=kind, r=row: self._proc_read_row_str(k, r, "name"), prefix=p)
+            self._register_live_string_dref(f"list_row_{row}_runway", lambda k=kind, r=row: self._proc_read_row_str(k, r, "runway"), prefix=p)
+            self._register_live_string_dref(f"list_row_{row}_index", lambda k=kind, r=row: self._proc_read_row_str(k, r, "index"), prefix=p)
+            self._register_live_string_dref(f"list_row_{row}_status", lambda k=kind, r=row: self._proc_read_row_str(k, r, "status"), prefix=p)
+            self._register_live_int_dref(f"list_row_{row}_is_selected", lambda k=kind, r=row: self._proc_read_row_int(k, r, "is_selected"), prefix=p)
+        self._create_command("scroll_up", f"Scroll {kind} procedure list up", lambda k=kind: self._cmd_proc_scroll_up(k), prefix=c)
+        self._create_command("scroll_down", f"Scroll {kind} procedure list down", lambda k=kind: self._cmd_proc_scroll_down(k), prefix=c)
+        self._create_command("select_row_1", f"Select {kind} row 1", lambda k=kind: self._cmd_proc_select_row(k, 1), prefix=c)
+        self._create_command("select_row_2", f"Select {kind} row 2", lambda k=kind: self._cmd_proc_select_row(k, 2), prefix=c)
+        self._create_command("select_row_3", f"Select {kind} row 3", lambda k=kind: self._cmd_proc_select_row(k, 3), prefix=c)
+        self._create_command("previous", f"Select previous {kind} procedure", lambda k=kind: self._cmd_proc_previous(k), prefix=c)
+        self._create_command("next", f"Select next {kind} procedure", lambda k=kind: self._cmd_proc_next(k), prefix=c)
+        self._create_command("clear_selected", f"Clear {kind} selection", lambda k=kind: self._cmd_proc_clear_selected(k), prefix=c)
+        self._create_command("activate", f"Insert selected {kind} procedure into FMS", lambda k=kind: self._cmd_proc_activate(k), prefix=c)
+        self._create_command("refresh", f"Reload {kind} procedures from CIFP", lambda k=kind: self._cmd_proc_refresh(k), prefix=c)
+
+    # ── PROC command handlers ──
+
+    def _cmd_proc_scroll_up(self, kind: str) -> None:
+        procs = self._proc_procs.get(kind, [])
+        if not procs:
+            return
+        w = self._proc_window.get(kind, 0)
+        new_start = max(0, w - self.PROC_VISIBLE_ROWS)
+        if new_start != w:
+            self._proc_window[kind] = new_start
+            self._proc_index[kind] = -1
+            self._proc_invalidate_cache(kind)
+            self._log(f"proc_scroll_up({kind}) ->", new_start)
+
+    def _cmd_proc_scroll_down(self, kind: str) -> None:
+        procs = self._proc_procs.get(kind, [])
+        n = len(procs)
+        if n <= 0:
+            return
+        w = self._proc_window.get(kind, 0)
+        max_w = self._proc_max_aligned_window_start(n)
+        new_start = min(w + self.PROC_VISIBLE_ROWS, max_w)
+        if new_start != w:
+            self._proc_window[kind] = new_start
+            self._proc_index[kind] = -1
+            self._proc_invalidate_cache(kind)
+            self._log(f"proc_scroll_down({kind}) ->", new_start)
+
+    def _cmd_proc_select_row(self, kind: str, row: int) -> None:
+        procs = self._proc_procs.get(kind, [])
+        w = self._proc_window.get(kind, 0)
+        pi = w + (row - 1)
+        if not procs or pi < 0 or pi >= len(procs):
+            return
+        self._proc_index[kind] = pi
+        self._proc_invalidate_cache(kind)
+        self._log(f"proc_select_row({kind}, {row}) -> index={pi}")
+
+    def _cmd_proc_previous(self, kind: str) -> None:
+        procs = self._proc_procs.get(kind, [])
+        if not procs:
+            return
+        w = self._proc_window.get(kind, 0)
+        idx = self._proc_index.get(kind, -1)
+        end = min(w + self.PROC_VISIBLE_ROWS, len(procs))
+        if idx < w or idx >= end:
+            self._proc_index[kind] = end - 1
+        else:
+            self._proc_index[kind] = max(w, idx - 1)
+        self._proc_invalidate_cache(kind)
+        self._log(f"proc_previous({kind}) -> index={self._proc_index[kind]}")
+
+    def _cmd_proc_next(self, kind: str) -> None:
+        procs = self._proc_procs.get(kind, [])
+        if not procs:
+            return
+        w = self._proc_window.get(kind, 0)
+        idx = self._proc_index.get(kind, -1)
+        end = min(w + self.PROC_VISIBLE_ROWS, len(procs))
+        if idx < w or idx >= end:
+            self._proc_index[kind] = w
+        else:
+            self._proc_index[kind] = min(end - 1, idx + 1)
+        self._proc_invalidate_cache(kind)
+        self._log(f"proc_next({kind}) -> index={self._proc_index[kind]}")
+
+    def _cmd_proc_clear_selected(self, kind: str) -> None:
+        self._proc_index[kind] = -1
+        self._proc_invalidate_cache(kind)
+        self._log(f"proc_clear_selected({kind})")
+
+    def _cmd_proc_refresh(self, kind: str) -> None:
+        self._cifp_cache.clear()
+        if not self.proc_dep_icao and not self.proc_dest_icao:
+            self._proc_airports_from_fms()
+        else:
+            self._proc_refresh()
+
+    def _cmd_proc_activate(self, kind: str) -> None:
+        """Insert selected procedure waypoints into the FMS."""
+        procs = self._proc_procs.get(kind, [])
+        idx = self._proc_index.get(kind, -1)
+        if idx < 0 or idx >= len(procs):
+            self._log(f"proc_activate({kind}): nothing selected")
+            return
+        proc = procs[idx]
+        if not proc.waypoints:
+            self._log(f"proc_activate({kind}): no waypoints for", proc.display_name)
+            return
+
+        # Look up airport coordinates to constrain navaid searches to the correct region.
+        apt_lat, apt_lon = None, None
+        apt_icao = self._proc_airport_for(kind)
+        if apt_icao:
+            apt_ref = xp.findNavAid(None, apt_icao, None, None, None, xp.Nav_Airport)
+            if apt_ref != xp.NAV_NOT_FOUND:
+                try:
+                    apt_info = xp.getNavAidInfo(apt_ref)
+                    apt_lat = apt_info.latitude
+                    apt_lon = apt_info.longitude
+                except Exception:
+                    pass
+
+        # Resolve nav refs for all procedure waypoints, constraining by airport lat/lon.
+        proc_nav = []
+        for ident in proc.waypoints:
+            ref = xp.findNavAid(None, ident, apt_lat, apt_lon, None, xp.Nav_Fix)
+            if ref == xp.NAV_NOT_FOUND:
+                ref = xp.findNavAid(None, ident, apt_lat, apt_lon, None, xp.Nav_VOR)
+            if ref == xp.NAV_NOT_FOUND:
+                ref = xp.findNavAid(None, ident, apt_lat, apt_lon, None, xp.Nav_NDB)
+            if ref == xp.NAV_NOT_FOUND:
+                ref = xp.findNavAid(None, ident, None, None, None, xp.Nav_Airport)
+            proc_nav.append((ref, ident))
+
+        write_idx = 0
+        try:
+            if proc.proc_type == "SID":
+                # Prepend: snapshot current FMS, clear, write SID then existing entries
+                count = xp.countFMSEntries()
+                existing = [xp.getFMSEntryInfo(i) for i in range(count)]
+                self._clear_fms()
+                for ref, ident in proc_nav:
+                    if ref != xp.NAV_NOT_FOUND:
+                        xp.setFMSEntryInfo(write_idx, ref, 0)
+                        write_idx += 1
+                for info in existing:
+                    try:
+                        lat = getattr(info, "lat", getattr(info, "latitude", 0.0))
+                        lon = getattr(info, "lon", getattr(info, "longitude", 0.0))
+                        nav_id = getattr(info, "navAidID", "").strip()
+                        if getattr(info, "type", None) == xp.Nav_LatLon or not nav_id:
+                            xp.setFMSEntryLatLon(write_idx, lat, lon, info.altitude)
+                        else:
+                            ref = xp.findNavAid(None, nav_id, lat, lon, None, xp.Nav_Fix)
+                            if ref == xp.NAV_NOT_FOUND:
+                                ref = xp.findNavAid(None, nav_id, lat, lon, None, xp.Nav_VOR)
+                            if ref != xp.NAV_NOT_FOUND:
+                                xp.setFMSEntryInfo(write_idx, ref, info.altitude)
+                            else:
+                                xp.setFMSEntryLatLon(write_idx, lat, lon, info.altitude)
+                        write_idx += 1
+                    except Exception:
+                        pass
+                # SID clears any stored arr/app splice points — plan structure changed
+                self._proc_splice_point["arr"] = -1
+                self._proc_splice_point["app"] = -1
+            else:
+                # STAR or APP: replace previous insertion of same kind if splice point known,
+                # otherwise append at end. Snapshot entries up to splice point, rewrite, then
+                # write new procedure waypoints starting at splice point.
+                splice = self._proc_splice_point.get(kind, -1)
+                count = xp.countFMSEntries()
+                if 0 <= splice <= count:
+                    keep = [xp.getFMSEntryInfo(i) for i in range(splice)]
+                    self._clear_fms()
+                    write_idx = 0
+                    for info in keep:
+                        try:
+                            lat = getattr(info, "lat", getattr(info, "latitude", 0.0))
+                            lon = getattr(info, "lon", getattr(info, "longitude", 0.0))
+                            nav_id = getattr(info, "navAidID", "").strip()
+                            if getattr(info, "type", None) == xp.Nav_LatLon or not nav_id:
+                                xp.setFMSEntryLatLon(write_idx, lat, lon, info.altitude)
+                            else:
+                                ref = xp.findNavAid(None, nav_id, lat, lon, None, xp.Nav_Fix)
+                                if ref == xp.NAV_NOT_FOUND:
+                                    ref = xp.findNavAid(None, nav_id, lat, lon, None, xp.Nav_VOR)
+                                if ref != xp.NAV_NOT_FOUND:
+                                    xp.setFMSEntryInfo(write_idx, ref, info.altitude)
+                                else:
+                                    xp.setFMSEntryLatLon(write_idx, lat, lon, info.altitude)
+                            write_idx += 1
+                        except Exception:
+                            pass
+                else:
+                    write_idx = xp.countFMSEntries()
+                self._proc_splice_point[kind] = write_idx
+                for ref, ident in proc_nav:
+                    if ref != xp.NAV_NOT_FOUND:
+                        xp.setFMSEntryInfo(write_idx, ref, 0)
+                        write_idx += 1
+
+            self._legs_init_after_load()
+            self._proc_loaded[kind] = proc.display_name
+            self._proc_status[kind] = f"LOADED {proc.display_name}"
+            self._log(f"proc_activate({kind}):", proc.proc_type, proc.display_name,
+                      "waypoints=", len(proc.waypoints), "written=", write_idx)
+        except Exception as exc:
+            self._proc_status[kind] = f"ERR {exc}"
+            self._log(f"proc_activate({kind}) error:", exc)
+
+        self._proc_invalidate_cache(kind)
