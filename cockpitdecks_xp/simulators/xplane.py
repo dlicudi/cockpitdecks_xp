@@ -1482,7 +1482,7 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
         """Checks availability of `sim/aircraft/view/acf_relative_path`"""
 
         def test_data() -> bool:
-            self.reload_caches(force=True)
+            self.reload_caches(force=False)
             return self.is_aircraft_loaded
 
         return self.wait_for_resource(resource="aircraft", test=test_data)
