@@ -711,6 +711,9 @@ class XPlane(XPWebsocketAPI, Simulator, SimulatorVariableListener):
 
         Simulator.__init__(self, cockpit=cockpit, environ=environ)
         self.cockpit.set_logging_level(__name__)
+        # Keep the aircraft-path dataref aligned with the shared variable database so
+        # websocket batch updates reach the object that is_aircraft_loaded reads.
+        self._aircraft_path = self.register(self._aircraft_path)
 
         SimulatorVariableListener.__init__(self, name=self.name)
 
